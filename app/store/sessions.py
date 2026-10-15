@@ -11,6 +11,8 @@ class Session:
     messages: list[dict] = field(default_factory=list)
     entities: dict[str, dict] = field(default_factory=dict)
     pending_action_id: str | None = None
+    suggested: set = field(default_factory=set)  # (kind, id) offered as 'Did you mean' in the previous turn
+    rejected: set = field(default_factory=set)   # (kind, id) the user said are NOT what they meant
     touched: float = field(default_factory=time.time)
 
 

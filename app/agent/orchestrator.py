@@ -13,6 +13,7 @@ from app.odoo.client import OdooError
 YES = re.compile(r"^\s*(yes|y|yeah|yep|confirm|confirmed|ok|okay|sure|do it|go ahead)\W*$", re.I)
 NO = re.compile(r"^\s*(no|n|nope|cancel|stop|abort|never ?mind)\W*$", re.I)
 ASKS_CONFIRM = re.compile(r"\b(reply|say|respond)\b.{0,40}\byes\b|\bconfirm\b.{0,30}\?", re.I | re.S)
+REJECT = re.compile(r"^\s*(no|nope|nah|not (that|it|this|them)|neither|none|different|a different|another|new)\b", re.I)
 MAX_STEPS = 6
 MAX_TOOL_RESULT_CHARS = 4000
 
@@ -32,7 +33,8 @@ Rules:
 - Amounts are in {currency}; never use any other currency or symbol.
 - Names may be misheard from voice ("Nazwa" for "Nizwa"). If a search result has exact_match false, NEVER say not found:
   ask "Did you mean <name>?" (up to 3 options) and wait. After the user confirms, search again using the confirmed
-  name before proposing anything. Only set allow_similar=true if the user says a product is different from a similar one.
+  name before proposing anything. If the user says NO to a suggestion, never suggest it again: treat the product as
+  new and ask whether to create it (price needed) instead of asking again. Only set allow_similar=true if the user says a product is different from a similar one.
 - Replies are sent to Telegram as plain text: no markdown tables, no bold, short lines.
 - Defaults: meetings last 30 minutes unless stated; do not ask for what has a default.
 - Resolve relative dates ("tomorrow", "next Monday") from the current time. Keep answers short.
@@ -99,6 +101,9 @@ class Orchestrator:
         session = st.sessions.get(caller, session_id)
         st.audit.write(caller, "prompt", session=session_id, chars=len(text))
         st.sessions.add(session, "user", text)
+        if session.suggested and REJECT.match(text):
+            session.rejected |= session.suggested  # "no" to a Did-you-mean: never offer those records again
+        session.suggested = set()
         direct = self._resolve_pending(caller, session, text)
         if direct:
             st.sessions.add(session, "assistant", direct["reply"])
@@ -133,7 +138,8 @@ class Orchestrator:
                     args = json.loads(call["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                out = run_tool(st, caller, call["function"]["name"], args, limit=min(10, st.settings.max_page_size), fuzzy=fuzzy)
+                out = run_tool(st, caller, call["function"]["name"], args, limit=min(10, st.settings.max_page_size), fuzzy=fuzzy,
+                               rejected=session.rejected)
                 if out.get("action"):
                     if session.pending_action_id:  # a newer proposal supersedes the old one
                         old = st.actions.get(session.pending_action_id, caller)
@@ -152,6 +158,7 @@ class Orchestrator:
             # The model must never ask for a "yes" when nothing is actually waiting for confirmation.
             reply = (f"I could not set that up: {failed[-1].split(': ', 1)[-1]}. Nothing was changed." if failed else
                      "I could not prepare that action. Please rephrase with the customer, product and quantity. Nothing was changed.")
+        session.suggested = set(fuzzy)  # what the user is being asked about right now
         st.sessions.add(session, "assistant", reply)
         return {"reply": reply, "pending_action": (
             {"id": pending.id, "kind": pending.kind, "preview": pending.payload} if pending else None)}

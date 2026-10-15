@@ -40,12 +40,14 @@ def check_product_free(odoo: OdooAPI, name: str) -> None:
         raise ValidationFailed(f"Product '{dup[0]['name']}' already exists (id {dup[0]['id']}, price {dup[0]['list_price']}); use it instead")
 
 
-def preview_product(odoo: OdooAPI, np: dict) -> dict:
+def preview_product(odoo: OdooAPI, np: dict, ignore_ids: frozenset | set = frozenset()) -> dict:
+    """ignore_ids: products the user already said are NOT what they meant; they never block creating a new one."""
     clean = _clean_new_product(np)
     check_product_free(odoo, clean["name"])
     if not clean["allow_similar"]:
-        close = fuzzy_find(odoo, "product.product", "name", clean["name"], ["list_price"],
-                           [["sale_ok", "=", True]], limit=1, threshold=SIMILAR_PRODUCT_THRESHOLD)
+        close = [c for c in fuzzy_find(odoo, "product.product", "name", clean["name"], ["list_price"],
+                                       [["sale_ok", "=", True]], limit=3, threshold=SIMILAR_PRODUCT_THRESHOLD)
+                 if c["id"] not in ignore_ids]
         if close:
             raise ValidationFailed(
                 f"A very similar product exists: '{close[0]['name']}' (id {close[0]['id']}, price {close[0]['list_price']}). "
@@ -64,7 +66,7 @@ def create_product(odoo: OdooAPI, clean: dict) -> dict:
     return odoo.search_read("product.product", [["id", "=", pid]], ["id", "name", "list_price", "default_code"], limit=1)[0]
 
 
-def build_preview(odoo: OdooAPI, partner_id: int, lines: list[dict[str, Any]]) -> dict:
+def build_preview(odoo: OdooAPI, partner_id: int, lines: list[dict[str, Any]], ignore_ids: frozenset | set = frozenset()) -> dict:
     """Validate a draft order against Odoo. Existing products are priced by Odoo; only a *new* product takes the user's price."""
     if not lines:
         raise ValidationFailed("An order needs at least one line")
@@ -79,7 +81,7 @@ def build_preview(odoo: OdooAPI, partner_id: int, lines: list[dict[str, Any]]) -
         if line.get("new_product"):
             if line.get("product_id"):
                 raise ValidationFailed("A line has either product_id or new_product, not both")
-            np = preview_product(odoo, line["new_product"])
+            np = preview_product(odoo, line["new_product"], ignore_ids)
             if np["name"].lower() in new_names:
                 raise ValidationFailed(f"Product '{np['name']}' appears twice as new")
             new_names.add(np["name"].lower())

@@ -181,7 +181,7 @@ Send `/id` to the bot, copy the number into `TELEGRAM_ALLOWED_USER_IDS`, stop th
 - Write requests answer with a short preview and ask you to reply `yes` or `no`.
 - `yes` / `ok` / `sure` / `confirm` execute; `no` / `cancel` / `stop` cancel. Anything else is treated as a new instruction.
 - A newer proposal replaces an unanswered older one. Pending actions expire after `ACTION_TTL_SECONDS`.
-- If a name is not found exactly, the bot asks *"Did you mean …?"*; answer yes (or give the right name) and it continues.
+- If a name is not found exactly, the bot asks *"Did you mean …?"*; answer yes (or give the right name) and it continues. Answer **no** and that record is never suggested again in the conversation: for a product the bot offers to create it as a new one (it asks for the price if you haven't given it).
 - Voice notes up to 3 minutes / 10 MB are accepted; the bot shows the transcript first so you can spot a mis-hearing.
 
 More example prompts: [`DEMO_PROMPTS.md`](DEMO_PROMPTS.md).

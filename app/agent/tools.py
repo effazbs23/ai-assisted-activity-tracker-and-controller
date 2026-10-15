@@ -59,8 +59,21 @@ def _date(v: str | None) -> dt.date | None:
 KIND = {"search_customers": "customer", "search_products": "product", "search_leads": "lead"}
 
 
-def suggestion(kind: str, query: str, rows: list[dict], fuzzy: set) -> dict[str, Any]:
-    """Close-but-not-exact matches. The model must ask the user; ids are blocked from writes until the next turn."""
+NEXT_STEP = {
+    "product": "It does not exist. Ask the user whether to create it as a NEW product (a price is needed; if they already "
+               "gave one, call propose_sales_order with a new_product line, or propose_create_product).",
+    "customer": "That customer does not exist and customers cannot be created here. Tell the user and ask for another name.",
+    "lead": "No such lead exists. Tell the user and ask for another name.",
+}
+
+
+def suggestion(kind: str, query: str, rows: list[dict], fuzzy: set, rejected: set | None = None) -> dict[str, Any]:
+    """Close-but-not-exact matches. The model must ask the user; ids are blocked from writes until the next turn.
+    Matches the user already rejected are never offered again."""
+    rows = [r for r in rows if (kind, r["id"]) not in (rejected or ())]
+    if not rows:
+        return {"data": {"exact_match": False, "query": query, "closest_matches": [],
+                         "instruction": f"The user rejected the close matches for '{query}'. Do NOT suggest them again. {NEXT_STEP[kind]}"}}
     for r in rows:
         fuzzy.add((kind, r["id"]))
     return {"data": {"exact_match": False, "query": query,
@@ -79,22 +92,25 @@ def _blocked(fuzzy: set, kind: str, ids) -> str | None:
             "and wait for their answer before using it.") if bad else None
 
 
-def run_tool(st, caller: str, name: str, args: dict[str, Any], limit: int = 10, fuzzy: set | None = None) -> dict[str, Any]:
+def run_tool(st, caller: str, name: str, args: dict[str, Any], limit: int = 10, fuzzy: set | None = None,
+             rejected: set | None = None) -> dict[str, Any]:
     """Returns {'data': ...} or {'error': ...}. 'action' is set when a write was parked."""
     odoo = st.odoo
     fuzzy = fuzzy if fuzzy is not None else set()
+    rejected = rejected or set()
+    ignore_products = {i for k, i in rejected if k == "product"}
     try:
         if name in KIND:
             q = args.get("query") or ""
             rows = {"search_customers": crm.search_customers, "search_products": sales.search_products,
                     "search_leads": lambda o, q, n: crm.search_leads(o, q or None, n)}[name](odoo, q, limit)
-            return suggestion(KIND[name], q, rows, fuzzy) if _is_fuzzy(rows) else {"data": rows}
+            return suggestion(KIND[name], q, rows, fuzzy, rejected) if _is_fuzzy(rows) else {"data": rows}
         if name in ("list_quotations", "list_sales_orders"):
             who = args.get("customer")
             if who:  # a misheard customer name must produce a question, not an empty list
                 found = crm.search_customers(odoo, who, 3)
                 if _is_fuzzy(found):
-                    return suggestion("customer", who, found, fuzzy)
+                    return suggestion("customer", who, found, fuzzy, rejected)
             dates = (_date(args.get("date_from")), _date(args.get("date_to")))
             if name == "list_quotations":
                 return {"data": sales.list_quotations(odoo, limit, who, *dates)}
@@ -108,13 +124,14 @@ def run_tool(st, caller: str, name: str, args: dict[str, Any], limit: int = 10, 
         action = None
         if name == "propose_create_product":
             action = proposals.product(st, caller, args["name"], args["price"], args.get("description", ""),
-                                       args.get("default_code", ""), allow_similar=bool(args.get("allow_similar")))
+                                       args.get("default_code", ""), allow_similar=bool(args.get("allow_similar")),
+                                       ignore_ids=ignore_products)
         elif name == "propose_sales_order":
             err = (_blocked(fuzzy, "customer", [int(args["customer_id"])])
                    or _blocked(fuzzy, "product", [int(l["product_id"]) for l in args["lines"] if l.get("product_id")]))
             if err:
                 return {"error": err}
-            action = proposals.order(st, caller, int(args["customer_id"]), args["lines"])
+            action = proposals.order(st, caller, int(args["customer_id"]), args["lines"], ignore_ids=ignore_products)
         elif name == "propose_calendar_event":
             err = _blocked(fuzzy, "customer", [int(x) for x in args.get("attendee_ids", [])])
             if err:

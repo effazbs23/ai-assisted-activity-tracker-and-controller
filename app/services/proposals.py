@@ -13,8 +13,8 @@ def _record(st, caller, kind, payload, key=None):
     return action
 
 
-def order(st, caller, customer_id: int, lines: list[dict], key=None):
-    return _record(st, caller, "create_order", sales.build_preview(st.odoo, customer_id, lines), key)
+def order(st, caller, customer_id: int, lines: list[dict], key=None, ignore_ids=frozenset()):
+    return _record(st, caller, "create_order", sales.build_preview(st.odoo, customer_id, lines, ignore_ids), key)
 
 
 def confirm_order(st, caller, order_id: int):
@@ -49,7 +49,7 @@ def event(st, caller, name: str, start, duration_min: int, attendee_ids: list[in
 
 
 def product(st, caller, name: str, price, description: str = "", default_code: str = "", key=None,
-            allow_similar: bool = False):
+            allow_similar: bool = False, ignore_ids=frozenset()):
     clean = sales.preview_product(st.odoo, {"name": name, "price": price, "description": description,
-                                            "default_code": default_code, "allow_similar": allow_similar})
+                                            "default_code": default_code, "allow_similar": allow_similar}, ignore_ids)
     return _record(st, caller, "create_product", clean, key)

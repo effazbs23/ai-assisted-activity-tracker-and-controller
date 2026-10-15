@@ -103,3 +103,81 @@ def test_vocabulary_endpoint(ctx):
     client, *_ = ctx
     d = client.get("/v1/vocabulary", headers=H).json()
     assert "XYZ Traders" in d["customers"] and "Workstation" in d["products"] and "XYZ Traders" not in d["products"]
+
+
+def redmi(odoo):
+    odoo.t["product.product"].append({"id": 30, "name": "Redmi Note 4", "list_price": 12000.0, "sale_ok": True, "default_code": ""})
+
+
+def say(client, text, sid="r1"):
+    r = client.post("/v1/prompt", json={"message": text, "session_id": sid}, headers=H)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def tool_results(llm, i):
+    return [m["content"] for m in llm.seen[i] if m["role"] == "tool"]
+
+
+def test_rejecting_a_suggestion_leads_to_creating_the_new_product(ctx):
+    """'Redmi Note 6' -> 'Did you mean Redmi Note 4?' -> no  => ask to create it, never ask about Note 4 again."""
+    client, odoo, llm = ctx
+    redmi(odoo)
+    llm.queue = [tool_call("search_products", {"query": "Redmi Note 6"}), {"content": "Did you mean Redmi Note 4?"}]
+    assert "Did you mean Redmi Note 4" in say(client, "sell 1 redmi note 6 to xyz traders")["reply"]
+    first = tool_results(llm, 1)[0]
+    assert '"exact_match": false' in first and "Redmi Note 4" in first
+
+    llm.queue = [tool_call("search_products", {"query": "Redmi Note 6"}),
+                 {"content": "Redmi Note 6 doesn't exist. Create it as a new product? What price?"}]
+    say(client, "no")
+    again = tool_results(llm, 3)[0]  # the second search in the new turn
+    assert '"closest_matches": []' in again and "Redmi Note 4" not in again and "NEW product" in again
+
+    llm.queue = [tool_call("propose_sales_order", {"customer_id": 6, "lines": [
+        {"quantity": 1, "new_product": {"name": "Redmi Note 6", "price": 15000}}]}), {"content": "Create it? yes/no"}]
+    out = say(client, "15000")
+    assert out["pending_action"]["kind"] == "create_order"
+    assert out["pending_action"]["preview"]["new_products"] == ["Redmi Note 6"] and odoo.created == []
+
+
+def test_new_product_is_still_blocked_if_the_user_never_rejected_the_suggestion(ctx):
+    client, odoo, llm = ctx
+    redmi(odoo)
+    llm.queue = [tool_call("propose_sales_order", {"customer_id": 6, "lines": [
+        {"quantity": 1, "new_product": {"name": "Redmi Note 6", "price": 15000}}]}), {"content": "Is it Redmi Note 4?"}]
+    out = say(client, "sell redmi note 6 at 15000 to xyz traders")
+    assert out["pending_action"] is None
+    assert "very similar" in tool_results(llm, 1)[0]
+
+
+def test_a_non_rejection_reply_does_not_mark_the_suggestion_rejected(ctx):
+    client, odoo, llm = ctx
+    redmi(odoo)
+    llm.queue = [tool_call("search_products", {"query": "Redmi Note 6"}), {"content": "Did you mean Redmi Note 4?"}]
+    say(client, "sell 1 redmi note 6 to xyz traders")
+    llm.queue = [tool_call("search_products", {"query": "Redmi Note 6"}), {"content": "Did you mean Redmi Note 4?"}]
+    say(client, "hmm what is its price?")  # not a "no"
+    assert "Redmi Note 4" in tool_results(llm, 3)[0] and '"closest_matches": []' not in tool_results(llm, 3)[0]
+
+
+@pytest.mark.parametrize("reply", ["no", "No.", "nope", "not that one", "a different product", "new product please"])
+def test_various_ways_of_saying_no_are_recognised(ctx, reply):
+    client, odoo, llm = ctx
+    redmi(odoo)
+    llm.queue = [tool_call("search_products", {"query": "Redmi Note 6"}), {"content": "Did you mean Redmi Note 4?"}]
+    say(client, "sell redmi note 6")
+    llm.queue = [tool_call("search_products", {"query": "Redmi Note 6"}), {"content": "Create it?"}]
+    say(client, reply)
+    assert '"closest_matches": []' in tool_results(llm, 3)[0]
+
+
+def test_rejection_is_per_session_and_per_record(ctx):
+    client, odoo, llm = ctx
+    redmi(odoo)
+    llm.queue = [tool_call("search_products", {"query": "Redmi Note 6"}), {"content": "Did you mean Redmi Note 4?"}]
+    say(client, "sell redmi note 6", sid="a")
+    llm.queue = [{"content": "ok"}, tool_call("search_products", {"query": "Redmi Note 6"}), {"content": "Did you mean?"}]
+    say(client, "no", sid="a")
+    say(client, "sell redmi note 6", sid="b")  # another conversation still gets the suggestion
+    assert "Redmi Note 4" in tool_results(llm, len(llm.seen) - 1)[0]
