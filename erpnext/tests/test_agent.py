@@ -126,3 +126,39 @@ def test_history_is_trimmed(ctx):
     for i in range(20):
         say(client, f"message {i}")
     assert len(llm.seen[-1]) <= 13  # system + at most SESSION_MAX_MESSAGES
+
+
+def test_manager_creates_a_new_item_inline_with_one_confirmation(ctx):
+    client, _, llm = ctx
+    manager = client.stubs["manager"]
+    llm.queue = [tool_call("search_clients", {"query": "XYZ Traders"}), tool_call("search_items", {"query": "glass whiteboard"}, id="c2"),
+                 tool_call("propose_create_quotation", {"party_type": "Customer", "party_id": "XYZ Traders", "lines": [
+                     {"new_item": {"name": "Glass Whiteboard", "price": 300}, "quantity": 5}]}, id="c3"),
+                 {"content": "New item Glass Whiteboard at 300, quotation total 1500. Reply yes."}]
+    out = say(client, "quote 5 glass whiteboards at 300 each for xyz traders", headers=HM)
+    assert out["pending_action"]["preview"]["lines"][0]["new_item"]["code"] == "GLASS-WHITEBOARD"
+    assert "New item(s) that will be created: Glass Whiteboard (code GLASS-WHITEBOARD) at 300." in out["reply"]
+    assert manager.created == []
+    done = say(client, "yes", headers=HM)
+    assert "New item(s) created: GLASS-WHITEBOARD" in done["reply"]
+    assert [t for t, _ in manager.created] == ["Item", "Quotation"]
+
+
+def test_a_sales_user_cannot_create_items_and_is_told_why(ctx):
+    client, alice, llm = ctx
+    llm.queue = [tool_call("propose_create_item", {"name": "Glass Whiteboard", "price": 300}),
+                 {"content": "An item manager must create that item."}]
+    out = say(client, "create an item glass whiteboard at 300")
+    assert out["pending_action"] is None and alice.created == []
+    assert "PermissionDenied" in [m["content"] for m in llm.seen[1] if m["role"] == "tool"][0]
+    assert "Creating new items is allowed for this user: no" in llm.seen[0][0]["content"]
+
+
+def test_rejected_lookalike_item_can_be_created_as_new(ctx):
+    client, _, llm = ctx
+    llm.queue = [tool_call("search_items", {"query": "Ergonomic Chairz"}), {"content": "Did you mean Ergonomic Chair?"},
+                 tool_call("propose_create_item", {"name": "Ergonomic Chairs", "price": 90}),
+                 {"content": "New item Ergonomic Chairs at 90. Reply yes."}]
+    say(client, "add ergonomic chairz", headers=HM)
+    out = say(client, "no, a different one", headers=HM)
+    assert out["pending_action"]["kind"] == "create_item" and out["pending_action"]["preview"]["name"] == "Ergonomic Chairs"

@@ -4,7 +4,7 @@ import datetime as dt
 
 import requests
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.erp.client import ERPError
 from app.security import Caller
@@ -116,9 +116,27 @@ class ActivityRequest(BaseModel):
     new_client_name: str | None = Field(default=None, max_length=140)
 
 
+class NewItem(BaseModel):
+    name: str = Field(min_length=2, max_length=140)
+    price: float = Field(gt=0, le=1_000_000)
+    description: str = Field(default="", max_length=1000)
+    uom: str | None = Field(default=None, max_length=40)
+    item_group: str | None = Field(default=None, max_length=140)
+    code: str | None = Field(default=None, max_length=140)
+    allow_similar: bool = False
+
+
 class Line(BaseModel):
-    item_id: str = Field(min_length=1, max_length=140)
+    """Either an existing item_id (priced by ERPNext) or a new_item to create (priced by the caller)."""
+    item_id: str | None = Field(default=None, min_length=1, max_length=140)
+    new_item: NewItem | None = None
     quantity: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def one_of(self):
+        if bool(self.item_id) == bool(self.new_item):
+            raise ValueError("Give exactly one of item_id or new_item")
+        return self
 
 
 class QuotationRequest(BaseModel):
@@ -153,6 +171,12 @@ def _iso(d: dt.date | None):
     return d.isoformat() if d else None
 
 
+@router.post("/items", status_code=202)
+def propose_item(body: NewItem, request: Request, caller: str = Caller, idempotency_key: str | None = Header(default=None)):
+    return _guard(proposals.item, request.app.state, caller, body.name, body.price, body.description, body.uom,
+                  body.item_group, body.code, body.allow_similar, idempotency_key)
+
+
 @router.post("/activities", status_code=202)
 def propose_activity(body: ActivityRequest, request: Request, caller: str = Caller,
                      idempotency_key: str | None = Header(default=None)):
@@ -164,13 +188,13 @@ def propose_activity(body: ActivityRequest, request: Request, caller: str = Call
 def propose_quotation(body: QuotationRequest, request: Request, caller: str = Caller,
                       idempotency_key: str | None = Header(default=None)):
     return _guard(proposals.quotation, request.app.state, caller, body.party_type, body.party_id,
-                  [l.model_dump() for l in body.lines], _iso(body.valid_till), idempotency_key)
+                  [l.model_dump(exclude_none=True) for l in body.lines], _iso(body.valid_till), idempotency_key)
 
 
 @router.post("/sales-orders", status_code=202)
 def propose_order(body: OrderRequest, request: Request, caller: str = Caller,
                   idempotency_key: str | None = Header(default=None)):
-    return _guard(proposals.order, request.app.state, caller, body.customer_id, [l.model_dump() for l in body.lines],
+    return _guard(proposals.order, request.app.state, caller, body.customer_id, [l.model_dump(exclude_none=True) for l in body.lines],
                   _iso(body.delivery_date), idempotency_key)
 
 

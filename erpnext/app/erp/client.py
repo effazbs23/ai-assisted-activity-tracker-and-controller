@@ -26,6 +26,7 @@ class ERPAPI(Protocol):
     def insert(self, doctype: str, doc: dict[str, Any]) -> dict[str, Any]: ...
     def update(self, doctype: str, name: str, values: dict[str, Any]) -> dict[str, Any]: ...
     def submit(self, doctype: str, name: str) -> dict[str, Any]: ...
+    def delete(self, doctype: str, name: str) -> None: ...
     def call(self, method: str, **kwargs) -> Any: ...
 
 
@@ -97,6 +98,9 @@ class ERPClient:
 
     def update(self, doctype, name, values):
         return self._request("PUT", f"/api/resource/{doctype}/{name}", json=values)["data"]
+
+    def delete(self, doctype, name):
+        self._request("DELETE", f"/api/resource/{doctype}/{name}")
 
     def submit(self, doctype, name):
         doc = self.get_doc(doctype, name)

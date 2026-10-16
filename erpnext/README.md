@@ -54,7 +54,9 @@ It is safe to re-run (finished steps are skipped) and configurable through envir
 |---|---|
 | "Met with XYZ Interiors today, sent a quotation for 20 workstations, awaiting their BOQ." | One **Sales Activity**: client, type (*Quotation Sent*), date, details, status (*Awaiting Client*). A preview is shown; **yes** saves it. |
 | "Met Desert Rose Furnishings today" (a client that does not exist yet) | A **Lead** is created together with the activity. |
-| "Create a quotation for Nizwa Builders for 4 executive desks and 4 ergonomic chairs" | A draft **Quotation**. Prices come from ERPNext, never from the user. |
+| "Create a quotation for Nizwa Builders for 4 executive desks and 4 ergonomic chairs" | A draft **Quotation**. Prices of existing items come from ERPNext, never from the user. |
+| "Add an item Glass Whiteboard, price 300" | Creates a **non-stock item** with its selling price. Only callers in `ITEM_CREATORS` (the manager in the demo). |
+| "Quote 5 glass whiteboards at 300 each for XYZ Traders" (the item does not exist) | **Inline creation**: one preview, one **yes**; the item (with price) and the quotation are created together. If the quotation fails, the new item is removed again. Item creators only. |
 | "Submit quotation SAL-QTN-2026-00009", then "Make it an order" | Submits the draft; creates a draft **Sales Order** from a submitted quotation. |
 | "Confirm sales order SAL-ORD-2026-00004" | Submits the order. Only callers listed in `CONFIRM_CALLERS`. |
 | "Open an opportunity for XYZ Interiors, 7000, proposal stage", "Move it to negotiation" | Creates or updates an **Opportunity** (stage, status Open/Replied/Closed, amount). |
@@ -112,7 +114,7 @@ The assistant works with standard ERPNext documents plus one small custom DocTyp
 | Customer, Lead | The *client*. Lookup is by name: exact first (customers, then leads), then fuzzy. |
 | Opportunity | Created for a Lead or Customer; stage and status updated later. |
 | Quotation, Sales Order | Drafts created by the assistant; submit and quotation → order conversion use ERPNext's own mapping. |
-| Item, Item Price | Item lookup and the selling price (Item Price in the *Standard Selling* list, then the item's standard rate). |
+| Item, Item Price | Item lookup and the selling price (Item Price in the *Standard Selling* list, then the item's standard rate). New items are created as **non-stock, sellable** items; ERPNext creates their *Standard Selling* price from the standard rate. |
 | Sales Stage | Valid Opportunity stages. |
 | **Sales Activity** (custom) | The structured log of what the team did. |
 
@@ -197,8 +199,8 @@ venv/bin/python scripts/setup_erpnext.py
 This uses the Administrator login (`ERP_ADMIN_USERNAME` / `ERP_ADMIN_PASSWORD`, default `Administrator` / `admin`) once to:
 - create the **Sales Activity** DocType with its permissions;
 - grant the Sales User and Sales Manager roles read access to **Item Price** and **Sales Stage**, so previews can show exact totals and valid stages;
-- create three users (`alice`, `bob`, `manager`) with API keys, adding the Sales User role to the manager;
-- write `ERP_USERS`, `API_KEYS`, `CONFIRM_CALLERS` and `MIDDLEWARE_KEYS` into `.env` (created from `.env.example`, mode 600). Re-running keeps credentials that still work and only generates new ones when needed.
+- create three users (`alice`, `bob`, `manager`) with API keys; the manager also gets the Sales User and **Item Manager** roles, and Item Manager gets read/write/create/delete on Item Price (delete only undoes an item the app just created);
+- write `ERP_USERS`, `API_KEYS`, `CONFIRM_CALLERS`, `ITEM_CREATORS` and `MIDDLEWARE_KEYS` into `.env` (created from `.env.example`, mode 600). Re-running keeps credentials that still work and only generates new ones when needed.
 
 **4. Load demo data** (optional, idempotent):
 
@@ -246,10 +248,10 @@ All settings come from environment variables; a `.env` in this directory is load
 | Group | Variables |
 |---|---|
 | ERPNext | `ERP_URL`, `ERP_TIMEOUT`, `ERP_USERS` (`caller:api_key:api_secret`), `ERP_ADMIN_USERNAME`, `ERP_ADMIN_PASSWORD` (setup scripts only) |
-| API | `API_KEYS` (`key:caller`), `CONFIRM_CALLERS`, `RATE_LIMIT_PER_MINUTE` (60), `MAX_PAGE_SIZE` (50), `ACTION_TTL_SECONDS` (900), `SESSION_TTL_SECONDS` (3600), `SESSION_MAX_MESSAGES` (12), `TIMEZONE` (`Asia/Muscat`) |
+| API | `API_KEYS` (`key:caller`), `CONFIRM_CALLERS`, `ITEM_CREATORS`, `RATE_LIMIT_PER_MINUTE` (60), `MAX_PAGE_SIZE` (50), `ACTION_TTL_SECONDS` (900), `SESSION_TTL_SECONDS` (3600), `SESSION_MAX_MESSAGES` (12), `TIMEZONE` (`Asia/Muscat`) |
 | LLM | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL`, `LLM_FALLBACK_MODELS`, `LLM_TEMPERATURE`, `LLM_EFFORT` |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USERS` (`telegram_id:caller`), `MIDDLEWARE_URL`, `MIDDLEWARE_KEYS` (`caller:api_key`) |
-| Speech-to-text | `STT_API_KEY`, `STT_BASE_URL`, `STT_MODEL`, `STT_LANGUAGE` |
+| Speech-to-text | `STT_API_KEY`, `STT_BASE_URL`, `STT_MODEL`, `STT_LANGUAGE` (default `en`; `ar` for Arabic; empty = auto-detect) |
 
 Keep three mappings consistent: `API_KEYS` (`key:caller`) and `MIDDLEWARE_KEYS` (`caller:key`) hold the same keys in opposite order, and every caller must also appear in `ERP_USERS`.
 
@@ -300,7 +302,8 @@ Read tools run immediately. Write tools only **propose**; the user must confirm.
 | `sales_summary` | read | Count and total per status for Quotations, Sales Orders or Opportunities |
 | `propose_log_activity` | write | One activity for an existing client, or `new_client_name` to also create a Lead |
 | `propose_create_opportunity`, `propose_update_opportunity` | write | Create; change stage, status (Open/Replied/Closed) or amount |
-| `propose_create_quotation`, `propose_create_sales_order` | write | Draft documents from item lines; prices from ERPNext |
+| `propose_create_item` | write | New non-stock item with the price the user gave (item creators only; duplicate and look-alike guard) |
+| `propose_create_quotation`, `propose_create_sales_order` | write | Draft documents from item lines: `item_id` (price from ERPNext) or `new_item {name, price}` to create the item inline (item creators only) |
 | `propose_submit_document` | write | Submit a draft Quotation or Sales Order (Sales Order: `CONFIRM_CALLERS` only) |
 | `propose_quotation_to_order` | write | Draft Sales Order from a **submitted** Quotation (ERPNext's own mapping) |
 
@@ -325,7 +328,7 @@ All `/v1/*` endpoints need `X-API-Key: <key>` and count against that caller's ra
 
 **Proposals** (return `202` with a preview; nothing is written yet; optional `Idempotency-Key` header)
 
-`POST /v1/activities` · `POST /v1/quotations` · `POST /v1/sales-orders` · `POST /v1/opportunities` · `PATCH /v1/opportunities/{id}` · `POST /v1/quotations/{id}/submit` · `POST /v1/sales-orders/{id}/submit` · `POST /v1/quotations/{id}/to-order`
+`POST /v1/items` · `POST /v1/activities` · `POST /v1/quotations` · `POST /v1/sales-orders` · `POST /v1/opportunities` · `PATCH /v1/opportunities/{id}` · `POST /v1/quotations/{id}/submit` · `POST /v1/sales-orders/{id}/submit` · `POST /v1/quotations/{id}/to-order`
 
 **Confirmation and chat**: `POST /v1/actions/{id}/confirm` · `POST /v1/actions/{id}/cancel` · `POST /v1/prompt` with `{"message": "...", "session_id": "..."}`.
 
@@ -349,7 +352,7 @@ Status codes: `401` bad key, `403` caller may not confirm Sales Orders, `404` no
 - **One ERPNext user per caller.** The middleware holds no admin credentials at run time. ERPNext enforces roles and user permissions on every read and write.
 - **Two-step writes**, executed only by `executor.py`, as the same caller who proposed them. Pending actions expire (`ACTION_TTL_SECONDS`), are bound to the caller, and carry an optional idempotency key.
 - **No hallucinated confirmations.** The model never relays "reply yes" unless a real pending action exists; ids that were only suggested as close matches in the same turn cannot be used for writes.
-- **Prices from ERPNext only** (Item Price, then standard rate). The assistant cannot set or accept prices.
+- **Prices from ERPNext for existing items** (Item Price, then standard rate); the user's price is never accepted for them. Only callers in `ITEM_CREATORS` (who also need the ERPNext *Item Manager* role) can create a **new** item with a price. A duplicate name is refused, a look-alike name needs the user's confirmation, and an item created inline is removed again (or disabled) if its document fails.
 - **Sales Orders** can be submitted only by callers in `CONFIRM_CALLERS`. Nothing can be deleted.
 - **Telegram allow-list** by numeric user id; voice files are never downloaded for unlisted users.
 - **API-key auth**, a per-caller rate limit, and a JSON-lines `audit.log` of prompts (length only, not text), proposals, executions, cancellations and ERPNext errors.
@@ -396,6 +399,7 @@ venv/bin/pytest tests                         # everything
 | Symptom | Cause and fix |
 |---|---|
 | `ERPNext denied access: … does not have doctype access … Item Price` (or `Sales Stage`) | Sales roles lack read access. Re-run `scripts/setup_erpnext.py`, which grants it. |
+| "This caller may not create new items" | The caller is not in `ITEM_CREATORS`. Set it (the demo uses `manager`) and restart; the ERPNext user also needs the *Item Manager* role. |
 | `No ERPNext user is configured for caller 'x'` | `x` is missing from `ERP_USERS`. Re-run `setup_erpnext.py`, or add `x:api_key:api_secret`. |
 | `ERPNext denied access: Invalid … token` / `401` | The API key or secret no longer matches (for example the user's keys were regenerated). Re-run `setup_erpnext.py`; it replaces credentials that stopped working. |
 | `Cannot log in to ERPNext … as admin` (setup scripts) | Wrong `ERP_ADMIN_USERNAME` / `ERP_ADMIN_PASSWORD`. |
@@ -414,6 +418,7 @@ venv/bin/pytest tests                         # everything
 - **Channel.** Telegram uses long polling. WhatsApp or a web app would be another thin client over `/v1/prompt`.
 - **Visibility.** Sales Users read Leads, Opportunities, Quotations and Sales Orders according to ERPNext's standard role permissions. For "own records only", add *if owner* permissions or User Permissions in ERPNext; only Sales Activity is restricted out of the box.
 - **Opportunity status.** Only Open, Replied and Closed can be set; *Lost* needs lost reasons and is not exposed. Previews and summaries are before tax.
+- **New items** are non-stock only (no warehouse or stock entries) and use the default group "Products" and unit "Nos" unless the user says otherwise; the item code is generated from the name.
 - **Quotation to order** requires a submitted quotation and a Customer (a Lead must be converted in ERPNext first).
 - **LLM coverage.** Verified live against an OpenAI-compatible endpoint (Groq). The Claude adapter is covered by unit tests against the SDK's message shapes but has not been exercised against the live Anthropic API without a key. The server-side refusal-fallback option is not enabled; refusals are returned as a plain message.
 - **Voice quality** depends on the speech model, especially for dialect Arabic mixed with English business terms; the `Heard: …` echo is the safeguard.

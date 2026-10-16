@@ -40,6 +40,9 @@ class StubERPNext:
     def __init__(self, user: str = "alice@example.com", deny: set[str] | None = None):
         self.user = user
         self.deny = deny or set()           # doctypes this user may not read
+        self.deny_insert: set[str] = set()  # doctypes this user may not create
+        self.auto_item_price = True         # like ERPNext: an Item with standard_rate gets a Standard Selling Item Price
+        self.deny_delete: set[str] = set()  # doctypes this user may not delete
         self.unreachable = False
         self.calls: list[tuple] = []
         self._seq = itertools.count(1)
@@ -82,6 +85,7 @@ class StubERPNext:
                  "status": "Awaiting Client", "details": "20 workstations", "owner": "bob@example.com"}],
         }
         self.created: list[tuple[str, dict]] = []
+        self.deleted: list[tuple[str, str]] = []
 
     # -- ERPClient interface ------------------------------------------------------------------------
     def _guard(self, doctype: str):
@@ -113,10 +117,22 @@ class StubERPNext:
 
     def insert(self, doctype, doc):
         self._guard(doctype)
+        if doctype in self.deny_insert:
+            raise ERPError(f"ERPNext denied access: User {self.user} does not have permission to create {doctype}")
         doc = copy.deepcopy(doc)
+        if doctype == "Item":
+            doc.update(name=doc["item_code"], disabled=0)
+            self.db["Item"].append(doc)
+            if self.auto_item_price and doc.get("standard_rate"):   # ERPNext creates the Standard Selling price itself
+                self.db["Item Price"].append({"name": f"IP-AUTO{next(self._seq):04d}", "item_code": doc["item_code"],
+                                              "price_list": "Standard Selling", "selling": 1, "price_list_rate": doc["standard_rate"]})
+            self.created.append((doctype, copy.deepcopy(doc)))
+            return copy.deepcopy(doc)
         prefix = {"Quotation": "SAL-QTN", "Sales Order": "SAL-ORD", "Lead": "CRM-LEAD", "Opportunity": "CRM-OPP",
                   "Sales Activity": "SACT"}.get(doctype, doctype.upper().replace(" ", "-"))
         doc["name"] = f"{prefix}-NEW{next(self._seq):04d}"
+        if doctype == "Item Price":
+            doc["name"] = f"IP-NEW{next(self._seq):04d}"
         doc.setdefault("docstatus", 0)
         doc["owner"] = self.user
         if doctype in ("Quotation", "Sales Order"):
@@ -131,6 +147,16 @@ class StubERPNext:
         self.db.setdefault(doctype, []).append(doc)
         self.created.append((doctype, copy.deepcopy(doc)))
         return copy.deepcopy(doc)
+
+    def delete(self, doctype, name):
+        self._guard(doctype)
+        if doctype in self.deny_delete:
+            raise ERPError(f"ERPNext denied access: User {self.user} does not have permission to delete {doctype}")
+        rows = self.db.get(doctype, [])
+        if not any(r["name"] == name for r in rows):
+            raise ERPError("ERPNext record or method not found")
+        self.db[doctype] = [r for r in rows if r["name"] != name]
+        self.deleted.append((doctype, name))
 
     def update(self, doctype, name, values):
         self._guard(doctype)

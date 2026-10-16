@@ -126,3 +126,104 @@ def test_activity_listing_filters(erp):
     assert [a["name"] for a in activities.list_activities(erp, 10, activity_type="meeting")] == ["SACT-00001"]
     assert [a["name"] for a in activities.list_activities(erp, 10, mine=True)] == ["SACT-00001"]
     assert [a["name"] for a in activities.list_activities(erp, 10, status="awaiting")] == ["SACT-00002"]
+
+
+# -- creating items ----------------------------------------------------------------------------------
+def test_preview_item_generates_a_unique_code_and_defaults(erp):
+    p = sales.preview_item(erp, {"name": "Glass Whiteboard XL", "price": 300})
+    assert p == {"code": "GLASS-WHITEBOARD-XL", "name": "Glass Whiteboard XL", "price": 300.0, "description": "",
+                 "uom": "Nos", "item_group": "Products"}
+    erp.db["Item"].append({"name": "GLASS-WHITEBOARD-XL", "item_name": "Something else entirely", "disabled": 0, "is_sales_item": 1})
+    assert sales.preview_item(erp, {"name": "Glass Whiteboard XL", "price": 300})["code"] == "GLASS-WHITEBOARD-XL-2"
+
+
+@pytest.mark.parametrize("spec", [{"name": "x", "price": 10}, {"name": "Fine Name"}, {"name": "Fine Name", "price": 0},
+                                   {"name": "Fine Name", "price": -5}, {"name": "Fine Name", "price": True},
+                                   {"name": "Fine Name", "price": 5_000_000}, {"name": "N" * 141, "price": 5}])
+def test_preview_item_rejects_bad_input(erp, spec):
+    with pytest.raises(ValidationFailed):
+        sales.preview_item(erp, spec)
+
+
+def test_preview_item_blocks_duplicates_and_asks_about_lookalikes(erp):
+    with pytest.raises(ValidationFailed, match="already exists"):
+        sales.preview_item(erp, {"name": "ergonomic chair", "price": 99})            # exact, any case
+    with pytest.raises(ValidationFailed, match="very similar"):
+        sales.preview_item(erp, {"name": "Ergonomic Chairs", "price": 99})
+    assert sales.preview_item(erp, {"name": "Ergonomic Chairs", "price": 99, "allow_similar": True})["code"] == "ERGONOMIC-CHAIRS"
+    assert sales.preview_item(erp, {"name": "Ergonomic Chairs", "price": 99}, ignore_ids={"CHAIR-ERG"})["name"] == "Ergonomic Chairs"
+
+
+def test_create_item_writes_item_and_selling_price(erp):
+    p = sales.preview_item(erp, {"name": "Glass Whiteboard", "price": 300, "description": "Wall mounted"})
+    out = sales.create_item(erp, p)
+    assert out["id"] == "GLASS-WHITEBOARD" and out["list_price"] == 300
+    item = next(d for t, d in erp.created if t == "Item")
+    assert item["is_stock_item"] == 0 and item["is_sales_item"] == 1 and item["standard_rate"] == 300 and item["stock_uom"] == "Nos"
+    assert [t for t, _ in erp.created] == ["Item"]          # ERPNext made the Standard Selling price itself
+    assert sales.item_rates(erp, ["GLASS-WHITEBOARD"]) == {"GLASS-WHITEBOARD": 300}
+
+
+def test_item_price_is_added_only_when_erpnext_did_not_create_it(erp):
+    erp.auto_item_price = False
+    sales.create_item(erp, sales.preview_item(erp, {"name": "Glass Whiteboard", "price": 300}))
+    price = next(d for t, d in erp.created if t == "Item Price")
+    assert price["price_list"] == "Standard Selling" and price["price_list_rate"] == 300
+
+
+def test_failed_price_entry_removes_the_new_item(erp):
+    erp.auto_item_price = False
+    erp.deny_insert = {"Item Price"}
+    with pytest.raises(Exception, match="removed again"):
+        sales.create_item(erp, sales.preview_item(erp, {"name": "Glass Whiteboard", "price": 300}))
+    assert ("Item", "GLASS-WHITEBOARD") in erp.deleted and not [i for i in erp.db["Item"] if i["name"] == "GLASS-WHITEBOARD"]
+
+
+def test_inline_new_item_line_in_a_preview(erp):
+    p = sales.build_preview(erp, "Quotation", "Customer", "XYZ Traders",
+                            [{"item_id": "WS-4", "quantity": 2}, {"new_item": {"name": "Glass Whiteboard", "price": 300}, "quantity": 5}])
+    assert [l["item_id"] for l in p["lines"]] == ["WS-4", "GLASS-WHITEBOARD"]
+    assert p["lines"][1]["new_item"]["code"] == "GLASS-WHITEBOARD" and p["total_before_tax"] == 2 * 360 + 5 * 300
+    assert erp.created == []   # a preview writes nothing
+
+
+@pytest.mark.parametrize("line", [{"quantity": 1}, {"item_id": "WS-4", "new_item": {"name": "Glass Whiteboard", "price": 3}, "quantity": 1},
+                                   {"new_item": {"name": "Glass Whiteboard"}, "quantity": 1}])
+def test_inline_lines_need_exactly_one_item_source_and_a_price(erp, line):
+    with pytest.raises(ValidationFailed):
+        sales.build_preview(erp, "Quotation", "Customer", "XYZ Traders", [line])
+
+
+def test_two_new_lines_cannot_share_a_name(erp):
+    spec = {"name": "Glass Whiteboard", "price": 300}
+    with pytest.raises(ValidationFailed, match="twice"):
+        sales.build_preview(erp, "Quotation", "Customer", "XYZ Traders", [{"new_item": spec, "quantity": 1}, {"new_item": dict(spec), "quantity": 2}])
+    a, b = {"name": "Glass Board A", "price": 1}, {"name": "Glass Board A1", "price": 1}   # different names, distinct codes
+    p = sales.build_preview(erp, "Quotation", "Customer", "XYZ Traders", [{"new_item": a, "quantity": 1}, {"new_item": b, "quantity": 1}])
+    assert len({l["item_id"] for l in p["lines"]}) == 2
+
+
+def test_item_that_cannot_be_deleted_is_disabled_so_it_can_never_be_sold(erp):
+    erp.auto_item_price = False
+    erp.deny_insert, erp.deny_delete = {"Item Price"}, {"Item"}
+    with pytest.raises(Exception, match="could not be removed; it is disabled"):
+        sales.create_item(erp, sales.preview_item(erp, {"name": "Glass Whiteboard", "price": 300}))
+    assert next(i for i in erp.db["Item"] if i["name"] == "GLASS-WHITEBOARD")["disabled"] == 1
+
+
+def test_inline_creation_creates_items_then_the_document(erp):
+    p = sales.build_preview(erp, "Quotation", "Customer", "XYZ Traders", [{"new_item": {"name": "Glass Whiteboard", "price": 300}, "quantity": 5}])
+    out = sales.create_document(erp, p)
+    assert out["created_items"] == ["GLASS-WHITEBOARD"] and out["doctype"] == "Quotation"
+    assert [t for t, _ in erp.created] == ["Item", "Quotation"]
+    quote = erp.created[-1][1]
+    assert quote["items"][0] == {"item_code": "GLASS-WHITEBOARD", "qty": 5, "rate": 300}
+
+
+def test_failed_document_rolls_the_new_items_back(erp):
+    p = sales.build_preview(erp, "Quotation", "Customer", "XYZ Traders", [{"new_item": {"name": "Glass Whiteboard", "price": 300}, "quantity": 5}])
+    erp.deny_insert = {"Quotation"}
+    with pytest.raises(Exception, match="removed again"):
+        sales.create_document(erp, p)
+    assert ("Item", "GLASS-WHITEBOARD") in erp.deleted and any(t == "Item Price" for t, _ in erp.deleted)
+    assert not [i for i in erp.db["Item"] if i["name"] == "GLASS-WHITEBOARD"]

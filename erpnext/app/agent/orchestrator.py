@@ -39,13 +39,18 @@ Rules:
   1-3 short lines and ask the user to reply yes or no.
 - You can create and update Opportunities, create draft Quotations and Sales Orders, and submit them; you cannot delete records
   or edit other fields; say so plainly instead of offering to.
-- Prices always come from ERPNext; never ask for or accept a price from the user.
+- Existing items are priced by ERPNext; never accept a different price for them. Creating new items is allowed for this user: {can_create}.
+  If a requested item does not exist and creation is allowed, never substitute another item: if the user gave its price, either call
+  propose_create_item, or (when the item is part of a quotation or order) put new_item {{name, price}} on that line so the item and the
+  document are created together after ONE yes. If no price was given, ask for it. Never guess a price. In your summary always say which items are NEW and will be created (name and price). If creation is not allowed, say
+  an item manager must create it.
 - Amounts are in {currency}; never use any other currency or symbol.
 - Names may be misheard from voice ("Nazwa" for "Nizwa"). If a search result has exact_match false, NEVER say not found: ask
   "Did you mean <name>?" (up to 3 options) and wait. After the user confirms, search again using the confirmed name before
   proposing anything. If the user says NO to a suggestion, never suggest it again.
 - Questions ("What quotations did we send last month?", "Show orders finalized this week") are answered from the list_* and
   sales_summary tools. Turn relative periods into exact dates from the current time. Report counts and totals from the tools only.
+- Always reply in English unless the user clearly writes in another language.
 - Replies are sent to a chat app as plain text: no markdown tables, no bold, short lines.
 Known from this conversation: {entities}"""
 
@@ -95,8 +100,11 @@ class Orchestrator:
         if kind == "log_activity":
             lead = f" New lead {r['lead_created']} created." if r.get("lead_created") else ""
             return f"Logged {r['activity_type']} with {r['client_name']} on {r['date']} (status: {r['status']}, id {r['id']}).{lead}"
+        if kind == "create_item":
+            return f"Item '{r['name']}' created (code {r['id']}) with a selling price of {r['list_price']}."
         if kind == "create_document":
-            return f"Draft {r['doctype']} {r['id']} created for {r['party_name']} (total {r['grand_total']} {r.get('currency') or ''})."
+            extra = f" New item(s) created: {', '.join(r['created_items'])}." if r.get("created_items") else ""
+            return f"Draft {r['doctype']} {r['id']} created for {r['party_name']} (total {r['grand_total']} {r.get('currency') or ''}).{extra}"
         if kind == "submit_document":
             return f"{r['doctype']} {r['id']} is now {r['status']}."
         if kind == "quotation_to_order":
@@ -123,6 +131,7 @@ class Orchestrator:
 
         tz = st.settings.timezone
         system = SYSTEM.format(currency=self.currency(caller), user=caller,
+                               can_create="yes" if caller in st.settings.item_creators else "no",
                                now=dt.datetime.now(ZoneInfo(tz)).strftime("%A %Y-%m-%d %H:%M"), tz=tz,
                                entities=json.dumps(session.entities) if session.entities else "nothing yet")
         messages = [{"role": "system", "content": system}, *session.messages]
@@ -172,10 +181,26 @@ class Orchestrator:
             # The model must never ask for a "yes" when nothing is actually waiting for confirmation.
             reply = (f"I could not set that up: {failed[-1].split(': ', 1)[-1]}. Nothing was changed." if failed else
                      "I could not prepare that action. Please rephrase with the client and what happened. Nothing was changed.")
+        if pending and (notice := self._new_item_notice(pending)) and notice not in reply:
+            reply = f"{reply}\n{notice}"  # stated by code, so the user always sees what will be created
         session.suggested = set(fuzzy)  # what the user is being asked about right now
         st.sessions.add(session, "assistant", reply)
         return {"reply": reply, "pending_action": (
             {"id": pending.id, "kind": pending.kind, "preview": pending.payload} if pending else None)}
+
+    @staticmethod
+    def _new_item_notice(action) -> str:
+        p = action.payload
+        if action.kind == "create_item":
+            new = [p]
+        elif action.kind == "create_document":
+            new = [l["new_item"] for l in p.get("lines", []) if l.get("new_item")]
+        else:
+            return ""
+        if not new:
+            return ""
+        what = "; ".join(f"{i['name']} (code {i['code']}) at {i['price']:g}" for i in new)
+        return f"New item(s) that will be created: {what}."
 
     @staticmethod
     def _remember(session, tool, out):

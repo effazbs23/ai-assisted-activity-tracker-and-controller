@@ -25,15 +25,33 @@ def log_activity(st, caller, activity_type, details, status=None, date=None, par
         erp, activity_type, details, status, date, party_type, party_id, new_client_name), key)
 
 
-def quotation(st, caller, party_type, party_id, lines, valid_till=None, key=None):
+def _require_item_creator(st, caller):
+    if caller not in st.settings.item_creators:
+        raise PermissionError("This caller may not create new items; ask a manager or use an existing item")
+
+
+def item(st, caller, name, price, description="", uom=None, item_group=None, code=None, allow_similar=False, key=None,
+         ignore_ids=frozenset()):
+    _require_item_creator(st, caller)
+    spec = {"name": name, "price": price, "description": description, "uom": uom, "item_group": item_group, "code": code,
+            "allow_similar": allow_similar}
+    return _record(st, caller, "create_item", sales.preview_item(st.erp_for(caller), spec, ignore_ids), key)
+
+
+def quotation(st, caller, party_type, party_id, lines, valid_till=None, key=None, ignore_ids=frozenset()):
+    if any(l.get("new_item") for l in lines):
+        _require_item_creator(st, caller)
     return _record(st, caller, "create_document",
-                   sales.build_preview(st.erp_for(caller), "Quotation", party_type, party_id, lines, valid_till=valid_till), key)
+                   sales.build_preview(st.erp_for(caller), "Quotation", party_type, party_id, lines, valid_till=valid_till,
+                                       ignore_ids=ignore_ids), key)
 
 
-def order(st, caller, customer_id, lines, delivery_date=None, key=None):
+def order(st, caller, customer_id, lines, delivery_date=None, key=None, ignore_ids=frozenset()):
+    if any(l.get("new_item") for l in lines):
+        _require_item_creator(st, caller)
     return _record(st, caller, "create_document",
                    sales.build_preview(st.erp_for(caller), "Sales Order", "Customer", customer_id, lines,
-                                       delivery_date=delivery_date), key)
+                                       delivery_date=delivery_date, ignore_ids=ignore_ids), key)
 
 
 def submit_document(st, caller, doctype, doc_id, key=None):

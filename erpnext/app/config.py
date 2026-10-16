@@ -38,6 +38,8 @@ class Settings:
     api_keys: dict[str, str] = field(default_factory=dict)
     # callers allowed to submit (finalize) Sales Orders; others may only draft
     confirm_callers: set[str] = field(default_factory=set)
+    # callers allowed to create new Items (and their selling price), alone or inline in a quotation/order
+    item_creators: set[str] = field(default_factory=set)
     rate_limit_per_minute: int = 60
     max_page_size: int = 50
     action_ttl_seconds: int = 900
@@ -68,6 +70,7 @@ class Settings:
             erp_users=users,
             api_keys=_pairs(env("API_KEYS", "")),
             confirm_callers={c.strip() for c in env("CONFIRM_CALLERS", "").split(",") if c.strip()},
+            item_creators={c.strip() for c in env("ITEM_CREATORS", "").split(",") if c.strip()},
             rate_limit_per_minute=int(env("RATE_LIMIT_PER_MINUTE", "60")),
             max_page_size=int(env("MAX_PAGE_SIZE", "50")),
             action_ttl_seconds=int(env("ACTION_TTL_SECONDS", "900")),

@@ -11,6 +11,8 @@ def execute(state, action: PendingAction) -> dict:
     p = action.payload
     if action.kind == "log_activity":
         return activities.create(erp, p)
+    if action.kind == "create_item":
+        return sales.create_item(erp, p)
     if action.kind == "create_document":
         return sales.create_document(erp, p)
     if action.kind == "submit_document":

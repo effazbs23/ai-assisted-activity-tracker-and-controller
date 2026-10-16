@@ -167,3 +167,50 @@ def test_audit_log_records_events(ctx, tmp_path):
     client.post(f"/v1/actions/{aid}/confirm", headers=H)
     text = (tmp_path / "audit.log").read_text()
     assert '"event": "propose"' in text and '"event": "execute"' in text and '"caller": "alice"' in text
+
+
+# -- creating items from chat/API ----------------------------------------------------------------------
+def test_only_item_creators_may_create_items(ctx):
+    client, alice, _ = ctx
+    body = {"name": "Glass Whiteboard", "price": 300}
+    assert client.post("/v1/items", json=body, headers=H).status_code == 403          # alice: not an item creator
+    assert alice.created == []
+    r = client.post("/v1/items", json=body, headers=HM)
+    assert r.status_code == 202 and r.json()["preview"]["code"] == "GLASS-WHITEBOARD"
+    manager = client.stubs["manager"]
+    assert manager.created == []                                                      # a proposal writes nothing
+    out = client.post(f"/v1/actions/{r.json()['action_id']}/confirm", headers=HM).json()["result"]
+    assert out["id"] == "GLASS-WHITEBOARD" and [t for t, _ in manager.created] == ["Item"]
+
+
+def test_item_validation_over_the_api(ctx):
+    client, *_ = ctx
+    assert client.post("/v1/items", json={"name": "Glass Whiteboard", "price": 0}, headers=HM).status_code == 422
+    assert client.post("/v1/items", json={"name": "Ergonomic Chair", "price": 90}, headers=HM).status_code == 422   # duplicate
+    assert client.post("/v1/items", json={"name": "Ergonomic Chairs", "price": 90}, headers=HM).status_code == 422  # look-alike
+    assert client.post("/v1/items", json={"name": "Ergonomic Chairs", "price": 90, "allow_similar": True}, headers=HM).status_code == 202
+
+
+def test_inline_item_in_a_quotation_over_the_api(ctx):
+    client, alice, _ = ctx
+    lines = [{"item_id": "WS-4", "quantity": 1}, {"new_item": {"name": "Glass Whiteboard", "price": 300}, "quantity": 2}]
+    body = {"party_type": "Customer", "party_id": "XYZ Traders", "lines": lines}
+    assert client.post("/v1/quotations", json=body, headers=H).status_code == 403     # alice may not create items inline either
+    r = client.post("/v1/quotations", json=body, headers=HM)
+    assert r.status_code == 202 and r.json()["preview"]["total_before_tax"] == 360 + 600
+    done = client.post(f"/v1/actions/{r.json()['action_id']}/confirm", headers=HM).json()["result"]
+    assert done["created_items"] == ["GLASS-WHITEBOARD"]
+    bad = {"party_type": "Customer", "party_id": "XYZ Traders", "lines": [{"quantity": 1}]}
+    assert client.post("/v1/quotations", json=bad, headers=HM).status_code == 422
+
+
+def test_item_creation_rolled_back_when_the_document_is_refused(ctx):
+    client, _, _ = ctx
+    manager = client.stubs["manager"]
+    body = {"party_type": "Customer", "party_id": "XYZ Traders",
+            "lines": [{"new_item": {"name": "Glass Whiteboard", "price": 300}, "quantity": 1}]}
+    aid = client.post("/v1/quotations", json=body, headers=HM).json()["action_id"]
+    manager.deny_insert = {"Quotation"}
+    r = client.post(f"/v1/actions/{aid}/confirm", headers=HM)
+    assert r.status_code == 502 and "removed again" in r.json()["detail"]
+    assert not [i for i in manager.db["Item"] if i["name"] == "GLASS-WHITEBOARD"]

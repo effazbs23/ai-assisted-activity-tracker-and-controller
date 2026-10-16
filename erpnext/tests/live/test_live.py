@@ -34,7 +34,8 @@ def users():
     return {c: ERPClient(S.erp_url, *S.erp_users[c], timeout=S.erp_timeout) for c in ("alice", "bob", "manager")}
 
 
-TEST_DOCTYPES = ["Sales Activity", "Sales Order", "Quotation", "Opportunity", "Lead"]
+TEST_DOCTYPES = ["Sales Activity", "Sales Order", "Quotation", "Opportunity", "Lead", "Item Price", "Item"]  # documents before the items they use
+SUBMITTABLE = {"Sales Order", "Quotation"}
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -50,7 +51,7 @@ def remove_records_created_by_these_tests(users):
     if not login.ok:
         return
     for d in TEST_DOCTYPES:
-        for r in manager.get_list(d, [], ["name", "docstatus"] if d != "Lead" else ["name"], 5000):
+        for r in manager.get_list(d, [], ["name", "docstatus"] if d in SUBMITTABLE else ["name"], 5000):
             if r["name"] in before[d]:
                 continue
             if r.get("docstatus") == 1:
@@ -62,6 +63,7 @@ class State:
     """Minimal stand-in for app.state with real ERPNext clients."""
     def __init__(self, users):
         self.settings = S
+        S.item_creators = S.item_creators or {"manager"}
         self.erp_for = lambda caller: users[caller]
         self.actions = ActionStore(900)
 
@@ -185,6 +187,39 @@ def test_opportunity_create_and_update(st, users):
         proposals.update_opportunity(st, "bob", opp["id"], sales_stage="Teleporting")
     found = parties.search_opportunities(users["bob"], "Sohar", 5)
     assert any(o["id"] == opp["id"] for o in found)
+
+
+def test_manager_creates_a_nonstock_item_with_a_price(st, users):
+    out = run(st, "manager", proposals.item(st, "manager", "LIVE TEST Glass Whiteboard", 300, "Wall mounted"))
+    assert out["id"] == "LIVE-TEST-GLASS-WHITEBOARD" and out["list_price"] == 300
+    item = users["manager"].get_doc("Item", out["id"])
+    assert item["is_stock_item"] == 0 and item["is_sales_item"] == 1 and item["stock_uom"] == "Nos"
+    # the selling price is now what quotations use, for a sales user who cannot create items
+    assert sales.item_rates(users["alice"], [out["id"]]) == {out["id"]: 300}
+    with pytest.raises(ValidationFailed, match="already exists"):
+        proposals.item(st, "manager", "live test glass whiteboard", 300)
+    with pytest.raises(PermissionError):
+        proposals.item(st, "alice", "LIVE TEST Another Item", 10)
+
+
+def test_inline_new_item_creates_item_price_and_quotation_together(st, users):
+    action = proposals.quotation(st, "manager", "Customer", "Sohar Contracting", [
+        {"item_id": "WS-4", "quantity": 2}, {"new_item": {"name": "LIVE TEST Bench", "price": 55.5}, "quantity": 4}])
+    assert action.payload["total_before_tax"] == 2 * 350 + 4 * 55.5
+    out = run(st, "manager", action)
+    assert out["created_items"] == ["LIVE-TEST-BENCH"] and out["doctype"] == "Quotation"
+    doc = users["manager"].get_doc("Quotation", out["id"])
+    assert {i["item_code"]: i["rate"] for i in doc["items"]} == {"WS-4": 350, "LIVE-TEST-BENCH": 55.5}
+    with pytest.raises(PermissionError):  # sales users cannot create items inline
+        proposals.quotation(st, "bob", "Customer", "Sohar Contracting", [{"new_item": {"name": "LIVE TEST X", "price": 1}, "quantity": 1}])
+
+
+def test_failed_inline_creation_leaves_no_orphan_item(st, users):
+    action = proposals.order(st, "manager", "Nizwa Builders", [{"new_item": {"name": "LIVE TEST Orphan", "price": 9}, "quantity": 1}])
+    action.payload["delivery_date"] = "1999-01-01"        # ERPNext refuses a delivery date before the order date
+    with pytest.raises(ERPError):
+        run(st, "manager", action)
+    assert users["manager"].get_list("Item", [["name", "=", "LIVE-TEST-ORPHAN"]], ["name"], 1) == []
 
 
 def test_erpnext_errors_surface_as_erperror(users):

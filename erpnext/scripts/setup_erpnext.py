@@ -19,7 +19,7 @@ from app.services.activities import ACTIVITY_TYPES, STATUSES
 USERS = [  # caller, email, full name, roles (Sales Manager is additive on top of Sales User in ERPNext)
     ("alice", "alice@example.com", "Alice Salem", ["Sales User"]),
     ("bob", "bob@example.com", "Bob Hinai", ["Sales User"]),
-    ("manager", "manager@example.com", "Maya Rawahi", ["Sales User", "Sales Manager"]),
+    ("manager", "manager@example.com", "Maya Rawahi", ["Sales User", "Sales Manager", "Item Manager"]),
 ]
 
 SALES_ACTIVITY = {
@@ -60,22 +60,31 @@ def working(caller: str, creds: dict[str, tuple[str, str]]) -> bool:
 
 # Sales roles need to read selling prices (exact totals before anything is saved) and the list of sales stages.
 EXTRA_READ_PERMISSIONS = [(dt, r) for dt in ("Item Price", "Sales Stage") for r in ("Sales User", "Sales Manager")]
+# Item Managers create items and their selling price (Item Price) from chat.
+ITEM_PRICE_WRITE_ROLES = ["Item Manager"]
 
 
-def grant_read(admin: AdminSession, doctype: str, role: str) -> None:
+def grant_read(admin: AdminSession, doctype: str, role: str, write: bool = False, delete: bool = False) -> None:
     rows = admin.request("GET", "/api/resource/Custom DocPerm", params={
-        "filters": f'[["parent","=","{doctype}"],["role","=","{role}"],["permlevel","=",0]]', "fields": '["name","read"]'})["data"]
-    if rows:
+        "filters": f'[["parent","=","{doctype}"],["role","=","{role}"],["permlevel","=",0]]',
+        "fields": '["name","read","write","create","delete"]'})["data"]
+    perms = {"read": 1, **({"write": 1, "create": 1} if write else {}), **({"delete": 1} if delete else {})}
+    if rows and all(rows[0].get(k) for k in perms):
         return
-    admin.insert("Custom DocPerm", {"parent": doctype, "parenttype": "DocType", "parentfield": "permissions",
-                                    "role": role, "permlevel": 0, "read": 1})
-    print(f"Granted {role} read access to {doctype}")
+    if rows:
+        admin.request("PUT", f"/api/resource/Custom DocPerm/{rows[0]['name']}", json=perms)
+    else:
+        admin.insert("Custom DocPerm", {"parent": doctype, "parenttype": "DocType", "parentfield": "permissions",
+                                        "role": role, "permlevel": 0, **perms})
+    print(f"Granted {role} {'read, write, create' + (' and delete' if delete else '') if write else 'read'} access to {doctype}")
 
 
 def main():
     admin = AdminSession()
     for doctype, role in EXTRA_READ_PERMISSIONS:
         grant_read(admin, doctype, role)
+    for role in ITEM_PRICE_WRITE_ROLES:
+        grant_read(admin, "Item Price", role, write=True, delete=True)   # delete only undoes an item this app just created
     if admin.exists("DocType", "Sales Activity"):
         print("DocType 'Sales Activity' already exists")
     else:
@@ -120,9 +129,10 @@ def main():
         "ERP_USERS": ",".join(f"{c}:{k}:{s}" for c, (k, s) in creds.items()),
         "API_KEYS": ",".join(f"{k}:{c}" for c, k in api_keys.items()),
         "CONFIRM_CALLERS": "manager",
+        "ITEM_CREATORS": "manager",
         "MIDDLEWARE_KEYS": ",".join(f"{c}:{k}" for c, k in api_keys.items()),
     })
-    print("Wrote ERP_USERS, API_KEYS, CONFIRM_CALLERS, MIDDLEWARE_KEYS to .env")
+    print("Wrote ERP_USERS, API_KEYS, CONFIRM_CALLERS, ITEM_CREATORS, MIDDLEWARE_KEYS to .env")
 
 
 if __name__ == "__main__":

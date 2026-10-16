@@ -16,8 +16,12 @@ def _fn(name, desc, props, required):
 
 S, N = {"type": "string"}, {"type": "number"}
 DATE = lambda d: {"type": "string", "description": f"YYYY-MM-DD. {d}".strip()}
-ITEMS = {"type": "array", "items": {"type": "object", "properties": {"item_id": S, "quantity": N},
-                                    "required": ["item_id", "quantity"]}}
+NEW_ITEM = {"type": "object", "description": "An item that does not exist yet. Needs the price the user gave. Only if item creation is allowed.",
+            "properties": {"name": S, "price": N, "description": S, "uom": S, "item_group": S, "allow_similar": {"type": "boolean"}},
+            "required": ["name", "price"]}
+ITEMS = {"type": "array", "items": {"type": "object", "properties": {"item_id": S, "new_item": NEW_ITEM, "quantity": N},
+                                    "description": "Each line has quantity and EITHER item_id (existing item) OR new_item (item to create).",
+                                    "required": ["quantity"]}}
 PARTY = {"type": "string", "enum": ["Customer", "Lead"]}
 
 TOOLS = [
@@ -42,6 +46,11 @@ TOOLS = [
         "Use for 'how many' and 'how much' questions.",
         {"doctype": {"type": "string", "enum": ["Quotation", "Sales Order", "Opportunity"]}, "customer": S,
          "date_from": DATE(""), "date_to": DATE("")}, ["doctype"]),
+    _fn("propose_create_item", "Propose creating a new sellable, non-stock item with its selling price (the user must give the price). "
+        "Only for callers allowed to create items. Set allow_similar=true ONLY if the user said it is different from a similar existing item. "
+        "Requires user confirmation.",
+        {"name": S, "price": N, "description": S, "uom": S, "item_group": S, "code": S, "allow_similar": {"type": "boolean"}},
+        ["name", "price"]),
     _fn("propose_log_activity", "Propose logging what the user did with a client: one record with activity_type, date, "
         "details and status. For an existing client pass party_type and party_id from search_clients (Opportunity ids are also "
         "accepted with party_type=Opportunity). For a client that does not exist yet and the user clearly means a new one, pass "
@@ -80,7 +89,8 @@ NEXT_STEP = {
     "client": "No such Customer or Lead exists. If the user is describing activity with a new client, call propose_log_activity "
               "with new_client_name (it creates a Lead). Otherwise tell the user and ask for another name.",
     "opportunity": "No such opportunity exists. Tell the user and ask for another name.",
-    "item": "That item does not exist and items cannot be created here. Tell the user and ask for another item.",
+    "item": "That item does not exist. If the user gave its price and item creation is allowed for them, create it with propose_create_item "
+            "or as a new_item line of the quotation/order; if no price was given, ask for the price. Never guess a price or substitute another item.",
 }
 KIND = {"search_clients": "client", "search_opportunities": "opportunity", "search_items": "item"}
 
@@ -117,6 +127,7 @@ def run_tool(st, caller: str, name: str, args: dict[str, Any], limit: int = 10, 
     erp = st.erp_for(caller)
     fuzzy = fuzzy if fuzzy is not None else set()
     rejected = rejected or set()
+    ignore_items = {i for k, i in rejected if k == "item"}  # look-alikes the user already said are different
     try:
         if name in KIND:
             q = args.get("query") or ""
@@ -170,15 +181,21 @@ def run_tool(st, caller: str, name: str, args: dict[str, Any], limit: int = 10, 
                 return {"error": err}
             action = proposals.update_opportunity(st, caller, args["opportunity_id"], args.get("sales_stage"),
                                                   args.get("status"), args.get("amount"))
+        elif name == "propose_create_item":
+            action = proposals.item(st, caller, args["name"], args["price"], args.get("description", ""), args.get("uom"),
+                                    args.get("item_group"), args.get("code"), bool(args.get("allow_similar")),
+                                    ignore_ids=ignore_items)
         elif name in ("propose_create_quotation", "propose_create_sales_order"):
             party_id = args.get("party_id") or args.get("customer_id")
-            err = _blocked(fuzzy, "client", [party_id]) or _blocked(fuzzy, "item", [str(l.get("item_id")) for l in args["lines"]])
+            err = (_blocked(fuzzy, "client", [party_id])
+                   or _blocked(fuzzy, "item", [str(l["item_id"]) for l in args["lines"] if l.get("item_id")]))
             if err:
                 return {"error": err}
             if name == "propose_create_quotation":
-                action = proposals.quotation(st, caller, args["party_type"], party_id, args["lines"], args.get("valid_till"))
+                action = proposals.quotation(st, caller, args["party_type"], party_id, args["lines"], args.get("valid_till"),
+                                             ignore_ids=ignore_items)
             else:
-                action = proposals.order(st, caller, party_id, args["lines"], args.get("delivery_date"))
+                action = proposals.order(st, caller, party_id, args["lines"], args.get("delivery_date"), ignore_ids=ignore_items)
         elif name == "propose_submit_document":
             action = proposals.submit_document(st, caller, args["doctype"], str(args["id"]))
         elif name == "propose_quotation_to_order":

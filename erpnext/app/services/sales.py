@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Any
 
 from app.erp.client import ERPAPI, ERPError
 from app.services import parties
 from app.services.errors import NotFound, ValidationFailed
-from app.services.search import fuzzy_find, name_filters
+from app.services.search import fuzzy_find, name_filters, similarity
 
 MAX_QTY = 10_000
+MAX_PRICE = 1_000_000
+SIMILAR_ITEM_THRESHOLD = 0.85
+DEFAULT_UOM, DEFAULT_ITEM_GROUP = "Nos", "Products"
 SUMMARY_ROWS = 1000
 PRICE_LIST = "Standard Selling"
 DOCS = {"Quotation": "Quotation", "Sales Order": "Sales Order"}
@@ -53,9 +57,72 @@ def search_items(erp: ERPAPI, q: str, limit: int) -> list[dict]:
              **{k: r[k] for k in ("match", "score") if k in r}} for r in rows]
 
 
+# -- creating items (non-stock, with a selling price) ---------------------------------------------------
+def _unique_code(erp: ERPAPI, wanted: str, taken: set[str]) -> str:
+    base = re.sub(r"[^A-Z0-9]+", "-", wanted.upper()).strip("-")[:40] or "ITEM"
+    code, n = base, 1
+    while code in taken or erp.get_list("Item", [["name", "=", code]], ["name"], 1):
+        n += 1
+        code = f"{base}-{n}"
+    return code
+
+
+def preview_item(erp: ERPAPI, spec: dict, ignore_ids=frozenset(), taken: set[str] | None = None) -> dict:
+    """Validate a new item. Rejects duplicates; asks about look-alikes unless allow_similar is set."""
+    name = str(spec.get("name") or "").strip()
+    price = spec.get("price")
+    if not 2 <= len(name) <= 140:
+        raise ValidationFailed("Item name must be 2 to 140 characters")
+    if not isinstance(price, (int, float)) or isinstance(price, bool) or not 0 < price <= MAX_PRICE:
+        raise ValidationFailed(f"A selling price between 0 and {MAX_PRICE} is required for a new item")
+    existing = erp.get_list("Item", [], ["name", "item_name"], 1000)
+    for r in existing:
+        if (r.get("item_name") or "").lower() == name.lower():
+            raise ValidationFailed(f"Item '{r['item_name']}' already exists (id {r['name']}); use it instead of creating it again")
+    close = sorted(((similarity(name, r.get("item_name") or ""), r) for r in existing if r["name"] not in ignore_ids),
+                   key=lambda t: -t[0])
+    if close and close[0][0] >= SIMILAR_ITEM_THRESHOLD and not spec.get("allow_similar"):
+        raise ValidationFailed(f"A very similar item exists: '{close[0][1]['item_name']}' (id {close[0][1]['name']}). Ask the user "
+                               "whether they mean that one; set allow_similar=true only if they say it is a different item")
+    taken = taken if taken is not None else set()
+    code = _unique_code(erp, str(spec.get("code") or name), taken)
+    taken.add(code)
+    return {"code": code, "name": name, "price": float(price), "description": str(spec.get("description") or "")[:1000],
+            "uom": str(spec.get("uom") or DEFAULT_UOM)[:40], "item_group": str(spec.get("item_group") or DEFAULT_ITEM_GROUP)[:140]}
+
+
+def _delete_item(erp: ERPAPI, code: str) -> bool:
+    """Best effort removal of an item this app just created (its prices first). If it cannot be deleted, disable it so
+    it can never be sold; returns whether it was actually removed."""
+    try:
+        for row in erp.get_list("Item Price", [["item_code", "=", code]], ["name"], 20):
+            erp.delete("Item Price", row["name"])
+        erp.delete("Item", code)
+        return True
+    except ERPError:
+        try:
+            erp.update("Item", code, {"disabled": 1})
+        except ERPError:
+            pass
+        return False
+
+
+def create_item(erp: ERPAPI, p: dict) -> dict:
+    erp.insert("Item", {"item_code": p["code"], "item_name": p["name"], "item_group": p["item_group"], "stock_uom": p["uom"],
+                        "is_stock_item": 0, "is_sales_item": 1, "standard_rate": p["price"], "description": p["description"] or p["name"]})
+    try:
+        # ERPNext itself creates the "Standard Selling" price from standard_rate; only add it if that did not happen
+        if not erp.get_list("Item Price", [["item_code", "=", p["code"]], ["price_list", "=", PRICE_LIST]], ["name"], 1):
+            erp.insert("Item Price", {"item_code": p["code"], "price_list": PRICE_LIST, "selling": 1, "price_list_rate": p["price"]})
+    except ERPError as exc:
+        removed = _delete_item(erp, p["code"])
+        raise ERPError(f"{exc} (the new item {p['code']} was {'removed again' if removed else 'created but could not be removed; it is disabled'})")
+    return {"id": p["code"], "name": p["name"], "list_price": p["price"], "uom": p["uom"], "item_group": p["item_group"]}
+
+
 # -- previews and creation ---------------------------------------------------------------------------
 def build_preview(erp: ERPAPI, doctype: str, party_type: str, party_id: str, lines: list[dict],
-                  delivery_date: str | None = None, valid_till: str | None = None) -> dict:
+                  delivery_date: str | None = None, valid_till: str | None = None, ignore_ids=frozenset()) -> dict:
     if doctype not in DOCS:
         raise ValidationFailed(f"Unsupported document {doctype}")
     if doctype == "Sales Order" and party_type != "Customer":
@@ -66,25 +133,44 @@ def build_preview(erp: ERPAPI, doctype: str, party_type: str, party_id: str, lin
     if not lines:
         raise ValidationFailed("At least one line is required")
     merged: dict[str, float] = {}
+    new_lines: list[tuple[dict, float]] = []
     for line in lines:
-        code, qty = str(line.get("item_id") or ""), line.get("quantity")
-        if not code or not isinstance(qty, (int, float)) or isinstance(qty, bool) or not 0 < qty <= MAX_QTY:
-            raise ValidationFailed(f"Each line needs an item_id and a quantity between 0 and {MAX_QTY}")
-        merged[code] = merged.get(code, 0) + qty
-    found = {r["name"]: r for r in erp.get_list("Item", [["name", "in", list(merged)], ["disabled", "=", 0], ["is_sales_item", "=", 1]],
-                                                ["name", "item_name"], len(merged))}
-    missing = [c for c in merged if c not in found]
-    if missing:
-        raise NotFound(f"Item {missing[0]} not found or not sellable")
-    rates = item_rates(erp, list(merged))
+        qty = line.get("quantity")
+        if not isinstance(qty, (int, float)) or isinstance(qty, bool) or not 0 < qty <= MAX_QTY:
+            raise ValidationFailed(f"Each line needs a quantity between 0 and {MAX_QTY}")
+        code, spec = str(line.get("item_id") or ""), line.get("new_item")
+        if bool(code) == bool(spec):
+            raise ValidationFailed("Each line needs exactly one of item_id (existing item) or new_item (item to create)")
+        if spec:
+            new_lines.append((spec, qty))
+        else:
+            merged[code] = merged.get(code, 0) + qty
     out_lines, total = [], 0.0
-    for code, qty in merged.items():
-        if code not in rates:
-            raise ValidationFailed(f"Item {found[code]['item_name']} has no selling price in ERPNext")
-        amount = round(qty * rates[code], 3)
+    if merged:
+        found = {r["name"]: r for r in erp.get_list("Item", [["name", "in", list(merged)], ["disabled", "=", 0], ["is_sales_item", "=", 1]],
+                                                    ["name", "item_name"], len(merged))}
+        missing = [c for c in merged if c not in found]
+        if missing:
+            raise NotFound(f"Item {missing[0]} not found or not sellable")
+        rates = item_rates(erp, list(merged))
+        for code, qty in merged.items():
+            if code not in rates:
+                raise ValidationFailed(f"Item {found[code]['item_name']} has no selling price in ERPNext")
+            amount = round(qty * rates[code], 3)
+            total += amount
+            out_lines.append({"item_id": code, "item_name": found[code]["item_name"], "quantity": qty,
+                              "rate": rates[code], "amount": amount})
+    taken: set[str] = set()
+    names: set[str] = set()
+    for spec, qty in new_lines:
+        item = preview_item(erp, spec, ignore_ids, taken)
+        if item["name"].lower() in names:
+            raise ValidationFailed(f"New item '{item['name']}' appears twice; combine the quantities into one line")
+        names.add(item["name"].lower())
+        amount = round(qty * item["price"], 3)
         total += amount
-        out_lines.append({"item_id": code, "item_name": found[code]["item_name"], "quantity": qty,
-                          "rate": rates[code], "amount": amount})
+        out_lines.append({"item_id": item["code"], "item_name": item["name"], "quantity": qty, "rate": item["price"],
+                          "amount": amount, "new_item": item})
     today = dt.date.today()
     preview = {"doctype": doctype, "party_type": party_type, "party_id": party_id, "party_name": name,
                "lines": out_lines, "total_before_tax": round(total, 3), "currency": company_currency(erp)}
@@ -109,16 +195,28 @@ def _future_date(value: str | None, default: dt.date) -> str:
 
 def create_document(erp: ERPAPI, p: dict) -> dict:
     today = dt.date.today().isoformat()
-    items = [{"item_code": l["item_id"], "qty": l["quantity"], "rate": l["rate"],
-              **({"delivery_date": p["delivery_date"]} if p["doctype"] == "Sales Order" else {})} for l in p["lines"]]
-    if p["doctype"] == "Quotation":
-        doc = {"quotation_to": p["party_type"], "party_name": p["party_id"], "transaction_date": today,
-               "valid_till": p["valid_till"], "order_type": "Sales", "items": items}
-    else:
-        doc = {"customer": p["party_id"], "transaction_date": today, "delivery_date": p["delivery_date"],
-               "order_type": "Sales", "items": items}
-    saved = erp.insert(p["doctype"], doc)
-    return _summary(p["doctype"], saved)
+    created: list[str] = []
+    try:
+        for line in p["lines"]:
+            if line.get("new_item"):
+                created.append(create_item(erp, line["new_item"])["id"])
+        items = [{"item_code": l["item_id"], "qty": l["quantity"], "rate": l["rate"],
+                  **({"delivery_date": p["delivery_date"]} if p["doctype"] == "Sales Order" else {})} for l in p["lines"]]
+        if p["doctype"] == "Quotation":
+            doc = {"quotation_to": p["party_type"], "party_name": p["party_id"], "transaction_date": today,
+                   "valid_till": p["valid_till"], "order_type": "Sales", "items": items}
+        else:
+            doc = {"customer": p["party_id"], "transaction_date": today, "delivery_date": p["delivery_date"],
+                   "order_type": "Sales", "items": items}
+        saved = erp.insert(p["doctype"], doc)
+    except ERPError as exc:
+        left = [c for c in created if not _delete_item(erp, c)]
+        note = (f" The new item(s) {', '.join(left)} were created before this failed and could not be removed (they are disabled)." if left else
+                (" The new item(s) were removed again." if created else ""))
+        raise ERPError(f"{exc}{note}")
+    out = _summary(p["doctype"], saved)
+    out["created_items"] = created
+    return out
 
 
 def quotation_to_order(erp: ERPAPI, quotation_id: str, delivery_date: str | None = None) -> dict:

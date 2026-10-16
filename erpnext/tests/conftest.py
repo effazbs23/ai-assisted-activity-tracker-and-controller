@@ -25,7 +25,7 @@ def tool_call(name, args, id="c1"):
 @pytest.fixture
 def ctx(tmp_path):
     """TestClient plus alice's and bob's ERPNext stubs and the scripted LLM. 'alice' is not a confirm caller."""
-    settings = Settings(api_keys={"k1": "alice", "k2": "bob", "k3": "manager"}, confirm_callers={"manager"},
+    settings = Settings(api_keys={"k1": "alice", "k2": "bob", "k3": "manager"}, confirm_callers={"manager"}, item_creators={"manager"},
                         audit_log_path=str(tmp_path / "audit.log"), rate_limit_per_minute=1000)
     alice, bob = StubERPNext("alice@example.com"), StubERPNext("bob@example.com")
     manager = StubERPNext("manager@example.com")
