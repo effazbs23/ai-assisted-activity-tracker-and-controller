@@ -1,0 +1,7 @@
+requests
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+anthropic
+pytest
