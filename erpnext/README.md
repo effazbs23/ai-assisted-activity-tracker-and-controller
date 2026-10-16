@@ -14,6 +14,18 @@ There is **no separate business database**: ERPNext stays the single source of t
 
 Every caller acts in ERPNext as **its own ERPNext user** (own API key and secret). ERPNext roles and permissions therefore decide what each person can read and change; the middleware has no shared super-user.
 
+## Quick start (one command)
+
+On Debian/Ubuntu, `run.sh` installs ERPNext if it is missing, starts it, prepares it for the assistant, loads demo data, runs every test and smoke-tests the API:
+
+```bash
+cd erpnext
+./run.sh              # everything; asks for your sudo password only if system packages are missing
+./run.sh help         # install | start | prepare | seed | test | smoke | serve | bot | stop | status
+```
+
+It is safe to re-run (finished steps are skipped) and configurable through environment variables such as `SITE_NAME`, `ADMIN_PASSWORD`, `ERP_PORT`, `BENCH_DIR`, `COMPANY_NAME`, `CURRENCY`, and `SKIP_INSTALL=1` when ERPNext is already installed. Logs of the processes it starts are in `erpnext/.run/`. A first install builds ERPNext from source and takes roughly 15 to 30 minutes. The manual steps are in [section 7](#7-setup-step-by-step).
+
 ## Contents
 1. [What you can do](#1-what-you-can-do)
 2. [How a request flows](#2-how-a-request-flows)
