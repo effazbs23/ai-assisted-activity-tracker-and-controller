@@ -1,97 +1,212 @@
 # ERPNext Activity Assistant
 
-A natural-language layer on top of **ERPNext**. A sales team member tells a chat bot (text or voice) what they did today; an LLM turns it into a structured **Sales Activity** record and can create or update Leads, Opportunities, Quotations and Sales Orders. They can also ask questions ("What quotations did we send last month?") answered live from ERPNext. There is no separate business database: ERPNext stays the single source of truth.
+A natural-language layer on top of **ERPNext (v15)** for a sales team. A salesperson tells a chat bot, by text or voice note, what they did today. An LLM turns it into a structured **Sales Activity** record, and can create or update Leads, Opportunities, Quotations and Sales Orders. They can also ask questions such as *"What quotations did we send last month?"*, answered live from ERPNext.
+
+There is **no separate business database**: ERPNext stays the single source of truth. The middleware only keeps short-lived conversation state (pending confirmations and recent messages) in memory.
 
 ```
  Sales user ──text / voice──▶ telegram_bot.py ──POST /v1/prompt──▶ FastAPI middleware ──REST API──▶ ERPNext v15
-                                │ voice → speech-to-text            │ LLM tool-calling (Claude or any   Leads · Opportunities
-                                │ Telegram id → caller              │ OpenAI-compatible endpoint)       Quotations · Sales Orders
-                                ▼                                   │ validation · confirmation         Sales Activity (custom)
-                           plain-text reply  ◀──────────────────────┘ rate limit · audit log
+                                │ voice → speech-to-text             │ LLM tool-calling (Claude or any    Leads · Opportunities
+                                │ Telegram id → caller               │ OpenAI-compatible endpoint)        Quotations · Sales Orders
+                                ▼                                    │ validation · confirmation          Sales Activity (custom DocType)
+                           plain-text reply  ◀───────────────────────┘ rate limit · audit log
 ```
 
-Each caller acts in ERPNext as **its own ERPNext user** (own API key and secret), so ERPNext roles and permissions decide what each person can see and change.
+Every caller acts in ERPNext as **its own ERPNext user** (own API key and secret). ERPNext roles and permissions therefore decide what each person can read and change; the middleware has no shared super-user.
 
-## What you can do
+## Contents
+1. [What you can do](#1-what-you-can-do)
+2. [How a request flows](#2-how-a-request-flows)
+3. [Daily-update rules (what the model extracts)](#3-daily-update-rules-what-the-model-extracts)
+4. [Data model in ERPNext](#4-data-model-in-erpnext)
+5. [Project layout](#5-project-layout)
+6. [Prerequisites](#6-prerequisites)
+7. [Setup, step by step](#7-setup-step-by-step)
+8. [Choosing the language model](#8-choosing-the-language-model)
+9. [Configuration reference](#9-configuration-reference)
+10. [Running](#10-running)
+11. [Using the Telegram bot](#11-using-the-telegram-bot)
+12. [Agent tools](#12-agent-tools)
+13. [REST API](#13-rest-api)
+14. [Security model](#14-security-model)
+15. [Demo data and demo prompts](#15-demo-data-and-demo-prompts)
+16. [Tests](#16-tests)
+17. [Troubleshooting](#17-troubleshooting)
+18. [Known limitations and next steps](#18-known-limitations-and-next-steps)
+
+---
+
+## 1. What you can do
 
 | Say (typed or spoken) | What happens |
 |---|---|
-| "Met with XYZ Interiors today, sent a quotation for 20 workstations, awaiting their BOQ." | One **Sales Activity**: client, type (Quotation Sent), date, details, status (Awaiting Client). Preview, then **yes** to save. |
-| "Met Desert Rose Furnishings today" (a client that does not exist) | A **Lead** is created together with the activity. |
-| "Create a quotation for Nizwa Builders for 4 executive desks and 4 ergonomic chairs" | Draft **Quotation**; prices come from ERPNext, never from the user. |
-| "Submit quotation SAL-QTN-2026-00009", "Make it an order" | Submit a draft; create a draft **Sales Order** from a submitted quotation. |
-| "Confirm sales order SAL-ORD-2026-00004" | Submit the order (only callers in `CONFIRM_CALLERS`). |
-| "Open an opportunity for XYZ Interiors, 7000, proposal stage" / "Move it to negotiation" | Create / update an **Opportunity**. |
-| "What quotations did we send last month?" / "Show orders finalized this week" / "How many quotations and what total?" | Answered from ERPNext (lists and counts/totals). |
-| "Meetings I had this week" | Answered from Sales Activity records. |
-| "Nazwa Builders" (misheard) | "Did you mean Nizwa Builders?" instead of "not found". |
+| "Met with XYZ Interiors today, sent a quotation for 20 workstations, awaiting their BOQ." | One **Sales Activity**: client, type (*Quotation Sent*), date, details, status (*Awaiting Client*). A preview is shown; **yes** saves it. |
+| "Met Desert Rose Furnishings today" (a client that does not exist yet) | A **Lead** is created together with the activity. |
+| "Create a quotation for Nizwa Builders for 4 executive desks and 4 ergonomic chairs" | A draft **Quotation**. Prices come from ERPNext, never from the user. |
+| "Submit quotation SAL-QTN-2026-00009", then "Make it an order" | Submits the draft; creates a draft **Sales Order** from a submitted quotation. |
+| "Confirm sales order SAL-ORD-2026-00004" | Submits the order. Only callers listed in `CONFIRM_CALLERS`. |
+| "Open an opportunity for XYZ Interiors, 7000, proposal stage", "Move it to negotiation" | Creates or updates an **Opportunity** (stage, status Open/Replied/Closed, amount). |
+| "What quotations did we send last month?", "Show all orders finalized this week", "How many quotations and what total?" | Answered from ERPNext lists and per-status counts/totals. |
+| "Which meetings did I have this week?" | Answered from Sales Activity records (`mine=true` limits to the signed-in user). |
+| "Nazwa Builders" (misheard by voice) | The bot asks *"Did you mean Nizwa Builders?"* instead of answering "not found". |
+| Any of the above as a Telegram **voice note** | The bot replies `Heard: …` first so a mis-hearing is easy to spot, then answers. |
 
-Writes always follow *propose → preview → "yes"*. The assistant cannot delete records. A daily update is logged as an **activity**, not turned into a quotation, unless the user asks and gives items and quantities.
+Writes always follow **propose → preview → "yes"**. The assistant cannot delete records, and it will say so rather than offering to.
 
-## Layout
+## 2. How a request flows
+
+1. **Telegram** → `telegram_bot.py` looks up the sender's numeric id in `TELEGRAM_USERS` to find the caller. Unlisted users can only use `/id`. Voice notes (max 3 minutes / 10 MB) are downloaded, renamed `.oga` → `.ogg`, and transcribed; real customer and item names are sent to the speech model as a spelling hint.
+2. The bot calls `POST /v1/prompt` with the text, a `session_id` (the Telegram user id) and that caller's API key.
+3. `app/agent/orchestrator.py` loads the session (recent turns and the client or opportunity already resolved), builds the system prompt (current time, signed-in user, company currency) and asks the LLM what to do. It runs the requested **tools** for up to 6 steps. Read tools return ERPNext data; write tools only create a **pending action**.
+4. The reply asks for confirmation. A bare "yes" or "no" is handled in code, not by the LLM: **yes** runs the pending action through `app/services/executor.py` (the only place that writes to ERPNext); **no** cancels it.
+5. Every proposal, execution, cancellation and ERPNext error is appended to `audit.log`.
+
+The same operations are available as plain REST endpoints ([section 13](#13-rest-api)) for other clients, with the same two-step safety.
+
+## 3. Daily-update rules (what the model extracts)
+
+A daily update becomes **one** activity record. If it describes several steps (a meeting *and* a quotation sent), the model logs the most significant one and puts the rest in `details`, unless the user clearly wants separate records.
+
+| Activity type | Typical wording |
+|---|---|
+| Meeting | met, visited, demo, site visit |
+| Call | phoned, spoke, had a call |
+| Quotation Sent | sent or shared a quotation or offer |
+| BOQ Received | the client sent their bill of quantities |
+| Order Finalized | the client confirmed or placed an order |
+| Other | anything else |
+
+| Status | Meaning |
+|---|---|
+| Open | just started, or nothing pending |
+| Awaiting Client | waiting for the client (BOQ, approval, reply) |
+| In Progress | work ongoing on our side |
+| Completed | finished or closed |
+
+Logging "sent a quotation" is an **activity**, not a document. A Quotation or Sales Order is created only when the user asks for one **and** gives items and quantities. Aliases such as `quote`, `boq`, `waiting`, `done` are normalised in `app/services/activities.py`.
+
+Worked example. Input: *"Met with XYZ Interiors today, sent a quotation for 20 workstations, awaiting their BOQ."* The model calls `search_clients("XYZ Interiors")`, then `propose_log_activity` with `activity_type = Quotation Sent`, `status = Awaiting Client`, `date = today`, `details = "Met today, sent quotation for 20 workstations, awaiting BOQ."` and the matched Lead id. After **yes**:
 
 ```
-app/
-  main.py, config.py       App factory and env-driven Settings
-  security.py              X-API-Key auth, per-caller rate limit, JSON-lines audit log
-  erp/client.py            ERPNext REST adapter (token auth per caller); the only code that talks to ERPNext
-  api/routes.py            REST /v1: reads, proposals, action confirm/cancel, /prompt
-  services/                parties (customers, leads, opportunities), activities, sales (items, quotations, orders,
-                           summaries), search (exact + fuzzy), proposals (validate + park), executor (single write path)
-  agent/                   llm.py (Claude and OpenAI-compatible), tools.py (tool schema + guards), orchestrator.py
-  store/                   pending actions (TTL, idempotency, caller-bound) and conversation sessions (in memory)
-scripts/                   setup_erpnext.py, seed_demo.py, reset_demo.py
-telegram_bot.py            Telegram client (text + voice), maps Telegram ids to callers
-tests/                     offline suite (in-memory ERPNext stub, scripted LLM) + tests/live (real ERPNext)
+Done. Logged Quotation Sent with XYZ Interiors on 2026-10-16 (status: Awaiting Client, id SACT-00022).
 ```
 
-## Prerequisites
+## 4. Data model in ERPNext
 
-- **ERPNext v15** reachable over HTTP with the setup wizard completed (a Company exists). Developed against `version-15` run by `../run_erpnext.sh` (site `mysite.local`, `http://127.0.0.1:8000`, `Administrator` / `admin`).
-- **Python 3.10+**.
+The assistant works with standard ERPNext documents plus one small custom DocType created by `scripts/setup_erpnext.py`.
+
+| ERPNext document | Used for |
+|---|---|
+| Customer, Lead | The *client*. Lookup is by name: exact first (customers, then leads), then fuzzy. |
+| Opportunity | Created for a Lead or Customer; stage and status updated later. |
+| Quotation, Sales Order | Drafts created by the assistant; submit and quotation → order conversion use ERPNext's own mapping. |
+| Item, Item Price | Item lookup and the selling price (Item Price in the *Standard Selling* list, then the item's standard rate). |
+| Sales Stage | Valid Opportunity stages. |
+| **Sales Activity** (custom) | The structured log of what the team did. |
+
+**Sales Activity** fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `client_name` | Data (required) | Display name of the client |
+| `activity_type` | Select (required) | Meeting, Call, Quotation Sent, BOQ Received, Order Finalized, Other |
+| `activity_date` | Date (required) | Default today |
+| `status` | Select (required) | Open, Awaiting Client, In Progress, Completed |
+| `reference_doctype` / `reference_name` | Select / Dynamic Link | Link to the Customer, Lead or Opportunity |
+| `details` | Small Text | The user's facts in one short sentence |
+| `owner` | (ERPNext standard) | The ERPNext user who logged it |
+
+Permissions on Sales Activity show the two visibility options: **Sales User** has read/write/create with *if owner* (sees only their own records); **Sales Manager** and System Manager see everything (the combined view).
+
+Choosing where activity lives is a client decision. This build uses a custom DocType because it gives real fields to filter and report on; the alternative is comments on the Opportunity.
+
+## 5. Project layout
+
+```
+erpnext/
+  app/
+    main.py, config.py     App factory; env-driven Settings
+    security.py            X-API-Key auth, per-caller rate limit, JSON-lines audit log
+    erp/client.py          ERPNext REST adapter (token auth per caller); the only code that talks to ERPNext
+    api/routes.py          REST /v1: reads, proposals, action confirm/cancel, /prompt
+    services/
+      parties.py           customers, leads, opportunities; combined client search; name lookup
+      activities.py        Sales Activity: validation, normalisation, listing, creation
+      sales.py             items and prices, quotation/order previews, creation, submit, summaries
+      search.py            exact search filters + fuzzy ranking ("Did you mean")
+      proposals.py         validate a requested write and park it as a pending action
+      executor.py          execute a confirmed action (single write path)
+    agent/
+      llm.py               Claude (Anthropic SDK) and OpenAI-compatible clients
+      tools.py             tool schema shown to the LLM, dispatcher, fuzzy-id guard
+      orchestrator.py      conversation loop, yes/no handling, system prompt, honesty guards
+    store/                 pending actions (TTL, idempotency, caller-bound); sessions (trimmed, expiring)
+  scripts/                 setup_erpnext.py, seed_demo.py, reset_demo.py
+  telegram_bot.py          Telegram long-polling client (text + voice)
+  tests/                   offline suite (in-memory ERPNext stub + scripted LLM) and tests/live (real ERPNext)
+```
+
+## 6. Prerequisites
+
+- **ERPNext v15**, reachable over HTTP, with the **setup wizard completed** (a Company must exist). Developed against `version-15` run by `../run_erpnext.sh` (site `mysite.local`, `http://127.0.0.1:8000`, `Administrator` / `admin`).
+- **Python 3.10+** (developed on 3.12).
 - An **LLM API key**: Claude (Anthropic) or any OpenAI-compatible provider.
-- For voice: a speech-to-text key (OpenAI-compatible `/audio/transcriptions`, e.g. Groq or OpenAI).
-- For Telegram: a bot token from @BotFather.
+- For voice: a speech-to-text key for an OpenAI-compatible `/audio/transcriptions` endpoint (Groq or OpenAI).
+- For Telegram: a bot token from [@BotFather](https://t.me/BotFather).
 
-## Setup
+## 7. Setup, step by step
+
+**1. Install**
 
 ```bash
 cd erpnext
-python3 -m venv venv && venv/bin/pip install -r requirements.txt
-
-# 1. Prepare ERPNext (idempotent): Sales Activity DocType, 3 users with API keys, read access to Item Price and
-#    Sales Stage for sales roles. Writes ERP_USERS, API_KEYS, CONFIRM_CALLERS into .env (created from .env.example).
-venv/bin/python scripts/setup_erpnext.py
-
-# 2. Demo data (idempotent): customers, items and prices, leads, opportunities, quotations, orders, activities
-venv/bin/python scripts/seed_demo.py
-
-# 3. Add your LLM key to .env (see below), then run
-venv/bin/uvicorn app.main:app_from_env --factory --port 8100     # API; docs at http://localhost:8100/docs
-venv/bin/python telegram_bot.py                                  # Telegram client
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
 ```
 
-`scripts/reset_demo.py --yes` removes activities, orders, quotations, opportunities and non-demo leads so you can seed again.
+**2. Make sure ERPNext is running and set up.** If `http://127.0.0.1:8000/api/method/ping` does not answer `{"message":"pong"}`, start your bench. If `bench start` stops because of the asset watcher (`yarn: not found`), start the processes without it: `bench serve --port 8000`, `bench schedule`, `bench worker`, plus the two bench redis servers.
 
-### Demo users
+A brand-new site has not run the setup wizard, and nothing can be created until it has (no Company, fiscal year or price lists). Complete it in the browser, or from the bench directory:
 
-| Caller | ERPNext user | Roles | Can submit Sales Orders |
-|---|---|---|---|
-| `alice` | alice@example.com | Sales User | no |
-| `bob` | bob@example.com | Sales User | no |
-| `manager` | manager@example.com | Sales User, Sales Manager | yes (`CONFIRM_CALLERS=manager`) |
+```bash
+bench --site mysite.local execute frappe.desk.page.setup_wizard.setup_wizard.setup_complete --kwargs "{'args': {
+  'language':'English','country':'Oman','timezone':'Asia/Muscat','currency':'OMR',
+  'company_name':'Al Mashani Trading Demo','company_abbr':'AMT','chart_of_accounts':'Standard',
+  'fy_start_date':'2026-01-01','fy_end_date':'2026-12-31','full_name':'Admin User',
+  'email':'admin@example.com','password':'admin'}}"
+```
 
-The **Sales Activity** permissions show the visibility options: sales users see only their own activities ("if owner"); the manager sees everyone's (the combined view).
+**3. Prepare ERPNext for the assistant** (idempotent, safe to re-run):
 
-## Choosing the language model
+```bash
+venv/bin/python scripts/setup_erpnext.py
+```
 
-Set in `.env`; no code change needed.
+This uses the Administrator login (`ERP_ADMIN_USERNAME` / `ERP_ADMIN_PASSWORD`, default `Administrator` / `admin`) once to:
+- create the **Sales Activity** DocType with its permissions;
+- grant the Sales User and Sales Manager roles read access to **Item Price** and **Sales Stage**, so previews can show exact totals and valid stages;
+- create three users (`alice`, `bob`, `manager`) with API keys, adding the Sales User role to the manager;
+- write `ERP_USERS`, `API_KEYS`, `CONFIRM_CALLERS` and `MIDDLEWARE_KEYS` into `.env` (created from `.env.example`, mode 600). Re-running keeps credentials that still work and only generates new ones when needed.
+
+**4. Load demo data** (optional, idempotent):
+
+```bash
+venv/bin/python scripts/seed_demo.py
+```
+
+**5. Configure the rest of `.env`**: your LLM key ([section 8](#8-choosing-the-language-model)), and for Telegram the bot token and `TELEGRAM_USERS` ([section 11](#11-using-the-telegram-bot)). `.env.example` documents every variable.
+
+**6. Run it** ([section 10](#10-running)).
+
+## 8. Choosing the language model
+
+Set in `.env`; no code change needed. The orchestrator speaks one dialect (OpenAI-style messages and tool calls); `app/agent/llm.py` translates for Claude.
 
 ```bash
 # Claude (default)
 LLM_PROVIDER=anthropic
 LLM_API_KEY=sk-ant-...
-LLM_MODEL=claude-sonnet-5-5       # or claude-haiku-5-5 for lowest cost, claude-opus-5-5 for the most capable
+LLM_MODEL=claude-sonnet-5-5       # claude-haiku-5-5 = lowest cost, claude-opus-5-5 = most capable
 LLM_EFFORT=medium                 # low | medium | high: thinking depth and cost
 
 # OpenAI
@@ -107,44 +222,186 @@ LLM_MODEL=openai/gpt-oss-120b
 LLM_FALLBACK_MODELS=openai/gpt-oss-20b
 ```
 
-The orchestrator speaks one dialect (OpenAI-style messages and tool calls); `app/agent/llm.py` translates for Claude. Do not set `temperature` for current Claude models: the adapter never sends it.
+Notes:
+- The Claude adapter never sends `temperature` (current Claude models reject non-default values) and never forces a tool choice. It replays the model's own response blocks unchanged within a tool loop, and turns a safety refusal into a plain reply.
+- OpenAI-compatible calls retry once, then fall through `LLM_FALLBACK_MODELS`. HTTP 400/401/403/404 are not retried.
+- If the provider is unavailable the API answers `503` and the bot says it is unavailable; nothing is changed.
 
-## Configuration reference
+## 9. Configuration reference
 
-See `.env.example` for every variable. The important ones: `ERP_URL`, `ERP_USERS` (`caller:api_key:api_secret`), `API_KEYS` (`key:caller`), `CONFIRM_CALLERS`, `LLM_*`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USERS` (`telegram_id:caller`), `MIDDLEWARE_KEYS` (`caller:api_key`), `STT_*`, `TIMEZONE` (default `Asia/Muscat`).
+All settings come from environment variables; a `.env` in this directory is loaded automatically (variables already set in the shell win). **`.env.example` has the full list with comments.**
 
-To find a Telegram id: message the bot `/id` (works for anyone), then add `id:caller` to `TELEGRAM_USERS` and restart. Unlisted users get nothing else.
+| Group | Variables |
+|---|---|
+| ERPNext | `ERP_URL`, `ERP_TIMEOUT`, `ERP_USERS` (`caller:api_key:api_secret`), `ERP_ADMIN_USERNAME`, `ERP_ADMIN_PASSWORD` (setup scripts only) |
+| API | `API_KEYS` (`key:caller`), `CONFIRM_CALLERS`, `RATE_LIMIT_PER_MINUTE` (60), `MAX_PAGE_SIZE` (50), `ACTION_TTL_SECONDS` (900), `SESSION_TTL_SECONDS` (3600), `SESSION_MAX_MESSAGES` (12), `TIMEZONE` (`Asia/Muscat`) |
+| LLM | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL`, `LLM_FALLBACK_MODELS`, `LLM_TEMPERATURE`, `LLM_EFFORT` |
+| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USERS` (`telegram_id:caller`), `MIDDLEWARE_URL`, `MIDDLEWARE_KEYS` (`caller:api_key`) |
+| Speech-to-text | `STT_API_KEY`, `STT_BASE_URL`, `STT_MODEL`, `STT_LANGUAGE` |
 
-## REST API (`X-API-Key` required; interactive docs at `/docs`)
+Keep three mappings consistent: `API_KEYS` (`key:caller`) and `MIDDLEWARE_KEYS` (`caller:key`) hold the same keys in opposite order, and every caller must also appear in `ERP_USERS`.
 
-Reads: `GET /v1/clients?q=`, `/v1/opportunities`, `/v1/items?q=`, `/v1/activities`, `/v1/quotations`, `/v1/sales-orders?finalized=true`, `/v1/quotations/{id}`, `/v1/sales-orders/{id}`, `/v1/summary?doctype=`, `/v1/vocabulary`.
-
-Proposals (return `202` with a preview; nothing is written yet): `POST /v1/activities`, `/v1/quotations`, `/v1/sales-orders`, `/v1/opportunities`, `PATCH /v1/opportunities/{id}`, `POST /v1/quotations/{id}/submit`, `/v1/sales-orders/{id}/submit`, `/v1/quotations/{id}/to-order`.
-
-Confirmation: `POST /v1/actions/{id}/confirm`, `/v1/actions/{id}/cancel`. Chat: `POST /v1/prompt {message, session_id}`. Optional `Idempotency-Key` header on proposals.
-
-## Security model
-
-- One ERPNext user per caller; the middleware has no shared super-user. ERPNext enforces roles and user permissions.
-- Writes are two-step and executed only by `app/services/executor.py`, as the same caller who proposed them. Pending actions expire (`ACTION_TTL_SECONDS`) and are bound to the caller.
-- The LLM never relays "reply yes" unless a real pending action exists. Ids that were only suggested as a close match in the same turn cannot be used for writes.
-- Prices always come from ERPNext (Item Price, then the item's standard rate). Quantities are bounded.
-- Sales Orders can be submitted only by callers in `CONFIRM_CALLERS`. Nothing can be deleted.
-- API-key auth, per-caller rate limit, JSON-lines `audit.log` of proposals, executions, cancellations and ERPNext errors.
-
-## Tests
+## 10. Running
 
 ```bash
-venv/bin/pytest tests --ignore=tests/live     # offline, no network (stubbed ERPNext, scripted LLM)
-venv/bin/pytest tests/live -v                 # against a running, seeded ERPNext; removes what it creates
+# API (interactive docs at http://localhost:8100/docs)
+venv/bin/uvicorn app.main:app_from_env --factory --port 8100
+
+# Telegram client (add --verbose for debug logs)
+venv/bin/python telegram_bot.py
+```
+
+- Health check: `curl localhost:8100/health` → `{"status":"ok"}`.
+- Run **only one** bot process per bot token; two pollers compete for updates.
+- State (pending actions, sessions, rate-limit counters) is in memory; restarting the API clears it.
+
+Reset and re-seed the demo data at any time:
+
+```bash
+venv/bin/python scripts/reset_demo.py --yes   # removes activities, orders, quotations, opportunities and non-demo leads
+venv/bin/python scripts/seed_demo.py
+```
+
+## 11. Using the Telegram bot
+
+**First-time pairing.** The bot ignores everyone except users in `TELEGRAM_USERS`. To find an id, send `/id` to the bot (this works for anyone). Add `id:caller` to `TELEGRAM_USERS` (for example `123456789:alice`), then restart the bot. Each Telegram user is mapped to one caller, and that caller is one ERPNext user.
+
+**Conversation rules**
+- Write requests answer with a short preview and ask you to reply `yes` or `no`.
+- `yes` / `ok` / `sure` / `confirm` execute; `no` / `cancel` / `stop` cancel. Anything else is treated as a new instruction.
+- A newer proposal replaces an unanswered older one. Pending actions expire after `ACTION_TTL_SECONDS`.
+- If a name is not found exactly, the bot asks *"Did you mean …?"*; answer yes (or give the right name) and it continues. Answer **no** and that record is never suggested again in the conversation; if the client is genuinely new, the activity can create a Lead.
+- Replies are plain text: markdown the model sometimes adds (bold, tables) is flattened before sending.
+
+## 12. Agent tools
+
+Read tools run immediately. Write tools only **propose**; the user must confirm.
+
+| Tool | Kind | Purpose |
+|---|---|---|
+| `search_clients` | read | Customers and Leads by name (each result has an `id` and `type`) |
+| `search_opportunities` | read | Opportunities by client name; empty query = latest; optional status |
+| `search_items` | read | Sellable items with ERPNext selling prices |
+| `list_activities` | read | Sales Activities, filtered by client, type, status, dates, `mine` |
+| `list_quotations`, `list_sales_orders` | read | Documents by customer, status, date range; `finalized=true` = submitted orders only |
+| `get_document` | read | Full detail of a Quotation, Sales Order, Opportunity or Lead, including item lines |
+| `sales_summary` | read | Count and total per status for Quotations, Sales Orders or Opportunities |
+| `propose_log_activity` | write | One activity for an existing client, or `new_client_name` to also create a Lead |
+| `propose_create_opportunity`, `propose_update_opportunity` | write | Create; change stage, status (Open/Replied/Closed) or amount |
+| `propose_create_quotation`, `propose_create_sales_order` | write | Draft documents from item lines; prices from ERPNext |
+| `propose_submit_document` | write | Submit a draft Quotation or Sales Order (Sales Order: `CONFIRM_CALLERS` only) |
+| `propose_quotation_to_order` | write | Draft Sales Order from a **submitted** Quotation (ERPNext's own mapping) |
+
+Guards in code (not left to the model): names that are only close matches are blocked from writes until the user confirms them; rejected suggestions are never offered again; the model cannot ask for "yes" unless a real action is pending; tool results are capped at 4,000 characters; quantities are bounded (0 to 10,000); dates must be valid and not in the past where that matters.
+
+## 13. REST API
+
+All `/v1/*` endpoints need `X-API-Key: <key>` and count against that caller's rate limit. Interactive docs: `/docs`.
+
+**Reads**
+
+| Endpoint | Parameters |
+|---|---|
+| `GET /v1/clients` | `q` (2–100 chars), `limit` |
+| `GET /v1/opportunities` | `q?`, `status?`, `limit` |
+| `GET /v1/items` | `q`, `limit` |
+| `GET /v1/activities` | `client?`, `activity_type?`, `status?`, `date_from?`, `date_to?`, `mine?`, `limit` |
+| `GET /v1/quotations`, `GET /v1/sales-orders` | `customer?`, `status?`, `date_from?`, `date_to?`, `limit` (sales orders also `finalized?`) |
+| `GET /v1/quotations/{id}`, `GET /v1/sales-orders/{id}` | full document with lines |
+| `GET /v1/summary` | `doctype`, `customer?`, `date_from?`, `date_to?` |
+| `GET /v1/vocabulary` | names used as a speech-recognition hint |
+
+**Proposals** (return `202` with a preview; nothing is written yet; optional `Idempotency-Key` header)
+
+`POST /v1/activities` · `POST /v1/quotations` · `POST /v1/sales-orders` · `POST /v1/opportunities` · `PATCH /v1/opportunities/{id}` · `POST /v1/quotations/{id}/submit` · `POST /v1/sales-orders/{id}/submit` · `POST /v1/quotations/{id}/to-order`
+
+**Confirmation and chat**: `POST /v1/actions/{id}/confirm` · `POST /v1/actions/{id}/cancel` · `POST /v1/prompt` with `{"message": "...", "session_id": "..."}`.
+
+Example, a two-step write:
+
+```bash
+KEY=<an API key from API_KEYS>
+# 1. propose: nothing is written
+curl -s -X POST localhost:8100/v1/activities -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"activity_type":"Meeting","details":"Showroom review","party_type":"Customer","party_id":"Nizwa Builders"}'
+# -> {"action_id":"…","status":"pending","preview":{"client_name":"Nizwa Builders","activity_type":"Meeting",…}}
+
+# 2. confirm: written to ERPNext as that caller's own user
+curl -s -X POST localhost:8100/v1/actions/<action_id>/confirm -H "X-API-Key: $KEY"
+```
+
+Status codes: `401` bad key, `403` caller may not confirm Sales Orders, `404` not found or action belongs to another caller, `410` action expired or cancelled, `422` validation failed, `429` rate limited, `502` ERPNext unreachable or refused (the reason is included), `503` the LLM is unavailable.
+
+## 14. Security model
+
+- **One ERPNext user per caller.** The middleware holds no admin credentials at run time. ERPNext enforces roles and user permissions on every read and write.
+- **Two-step writes**, executed only by `executor.py`, as the same caller who proposed them. Pending actions expire (`ACTION_TTL_SECONDS`), are bound to the caller, and carry an optional idempotency key.
+- **No hallucinated confirmations.** The model never relays "reply yes" unless a real pending action exists; ids that were only suggested as close matches in the same turn cannot be used for writes.
+- **Prices from ERPNext only** (Item Price, then standard rate). The assistant cannot set or accept prices.
+- **Sales Orders** can be submitted only by callers in `CONFIRM_CALLERS`. Nothing can be deleted.
+- **Telegram allow-list** by numeric user id; voice files are never downloaded for unlisted users.
+- **API-key auth**, a per-caller rate limit, and a JSON-lines `audit.log` of prompts (length only, not text), proposals, executions, cancellations and ERPNext errors.
+- **Secrets** live in `.env` (mode 600, git-ignored). Remove `ERP_ADMIN_*` from it after setup in production.
+- **Data sharing.** Customer names and activity notes are sent to the chosen LLM provider and, for voice, to the speech provider. Confirm that is acceptable under the client's data policy.
+
+## 15. Demo data and demo prompts
+
+`scripts/seed_demo.py` creates (company currency OMR): 6 customers (Nizwa Builders, Gulf Interiors LLC, XYZ Traders, Muscat Office Solutions, Sohar Contracting, Salalah Hospitality Group), 6 items with prices (Workstation 4-Seat 350, Executive Desk 420, Ergonomic Chair 95, Conference Table 780, Filing Cabinet 140, Glass Whiteboard 60), 3 leads (XYZ Interiors, Al Khuwair Developers, Barka Fit-Out Works), 3 opportunities, 5 quotations (4 submitted, 1 draft), 3 sales orders (2 submitted) and 13 sales activities spread over the last five weeks. Transactions are created **as the sales users themselves**, so ownership and permissions look real.
+
+| Caller | ERPNext user | Roles | Can submit Sales Orders |
+|---|---|---|---|
+| `alice` | alice@example.com | Sales User | no |
+| `bob` | bob@example.com | Sales User | no |
+| `manager` | manager@example.com | Sales User, Sales Manager | yes |
+
+Things to try:
+
+```
+Met with XYZ Interiors today, sent a quotation for 20 workstations, awaiting their BOQ.     (alice)
+Had a call with Nazwa Builders this morning, they sent the BOQ over.                        (misheard name)
+Visited Desert Rose Furnishings today, they want a quote soon.                              (new client → Lead)
+Create a quotation for Nizwa Builders for 4 executive desks and 4 ergonomic chairs.
+What quotations did we send last month?
+Show all orders finalized this week.                                                        (manager)
+How many quotations do we have and what is their total value?
+Which meetings did I have this week?                                                        (own vs manager view)
+Move the Gulf Interiors opportunity to the proposal stage.
+```
+
+## 16. Tests
+
+```bash
+venv/bin/pytest tests --ignore=tests/live     # offline: no network, no ERPNext (stubbed ERPNext, scripted LLM)
+venv/bin/pytest tests/live -v                 # against a running, seeded ERPNext
 venv/bin/pytest tests                         # everything
 ```
 
-## Known limitations and next steps
+- **Offline (67 tests):** agent conversations (confirmation, cancellation, fuzzy-name guards, permissions, session isolation), REST API (auth, idempotency, caller binding, error mapping, rate limit, audit log), services (search, previews, summaries, activity rules), both LLM adapters (request shapes, tool-call parsing, fallbacks, refusals) and the Telegram bot.
+- **Live (10 tests):** real ERPNext calls as each of the three users: authentication, fuzzy search, ERPNext prices, summaries, own-vs-manager activity visibility, the quotation → submit → order → confirm lifecycle, opportunity create/update, and error mapping. They **delete the records they create**, using the administrator login in `.env`. They skip automatically when ERPNext or the credentials are missing.
 
-- State (pending actions, sessions, rate-limit counters) is in memory; a restart clears it. Move it to SQLite/Redis before running more than one process.
-- Telegram uses long polling. WhatsApp or a web app would be another thin client over `/v1/prompt`.
-- Sales Users read Leads, Opportunities, Quotations and Sales Orders according to ERPNext's standard role permissions. For "own records only", add "if owner" permissions or User Permissions in ERPNext; only Sales Activity is restricted out of the box.
-- Opportunity `status` can be set to Open, Replied or Closed; "Lost" needs lost reasons and is not exposed. Quotation/Sales Order amounts shown in previews are before tax.
-- Verified live with an OpenAI-compatible endpoint (Groq). The Claude adapter is covered by unit tests against the SDK's message shapes, but has not been exercised against the live Anthropic API without a key.
-- Claude refusals are returned as a plain message; the server-side refusal-fallback option is not enabled.
+## 17. Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `ERPNext denied access: … does not have doctype access … Item Price` (or `Sales Stage`) | Sales roles lack read access. Re-run `scripts/setup_erpnext.py`, which grants it. |
+| `No ERPNext user is configured for caller 'x'` | `x` is missing from `ERP_USERS`. Re-run `setup_erpnext.py`, or add `x:api_key:api_secret`. |
+| `ERPNext denied access: Invalid … token` / `401` | The API key or secret no longer matches (for example the user's keys were regenerated). Re-run `setup_erpnext.py`; it replaces credentials that stopped working. |
+| `Cannot log in to ERPNext … as admin` (setup scripts) | Wrong `ERP_ADMIN_USERNAME` / `ERP_ADMIN_PASSWORD`. |
+| Nothing can be created; missing Company, Fiscal Year or price list | The ERPNext setup wizard has not been completed ([step 2](#7-setup-step-by-step)). |
+| `bench start` exits with `yarn: not found` | The asset watcher needs yarn. Start `bench serve`, `schedule`, `worker` and the redis servers separately, or install yarn. |
+| `AI service unavailable: … 429` | The LLM provider rate-limited you (free tiers do this quickly). Use a paid key, a fallback model, or wait. |
+| `AI service unavailable: … 400 … Tool call validation failed` | The model sent an argument the provider's schema check rejected (for example `null` for a string). Retry; try a stronger model. |
+| Bot answers "not authorised" | The Telegram id is not in `TELEGRAM_USERS`. Send `/id`, add `id:caller`, restart the bot. |
+| Voice note fails | `STT_API_KEY` is empty or the note is over 3 minutes / 10 MB. |
+| "That request has expired" after typing yes | The action outlived `ACTION_TTL_SECONDS`, or the API restarted (state is in memory). Ask again. |
+| Quotation totals look low | ERPNext does not fill item rates on REST insert; this app always sends the rate. Totals in previews and summaries are **before tax**. |
+
+## 18. Known limitations and next steps
+
+- **In-memory state.** Pending actions, sessions and rate-limit counters are lost on restart and are not shared across processes. Move them to SQLite or Redis before running more than one worker.
+- **Channel.** Telegram uses long polling. WhatsApp or a web app would be another thin client over `/v1/prompt`.
+- **Visibility.** Sales Users read Leads, Opportunities, Quotations and Sales Orders according to ERPNext's standard role permissions. For "own records only", add *if owner* permissions or User Permissions in ERPNext; only Sales Activity is restricted out of the box.
+- **Opportunity status.** Only Open, Replied and Closed can be set; *Lost* needs lost reasons and is not exposed. Previews and summaries are before tax.
+- **Quotation to order** requires a submitted quotation and a Customer (a Lead must be converted in ERPNext first).
+- **LLM coverage.** Verified live against an OpenAI-compatible endpoint (Groq). The Claude adapter is covered by unit tests against the SDK's message shapes but has not been exercised against the live Anthropic API without a key. The server-side refusal-fallback option is not enabled; refusals are returned as a plain message.
+- **Voice quality** depends on the speech model, especially for dialect Arabic mixed with English business terms; the `Heard: …` echo is the safeguard.
