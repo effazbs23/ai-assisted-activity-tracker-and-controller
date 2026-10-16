@@ -10,6 +10,8 @@ A middleware that lets a sales team work in Odoo 20 by **chatting with a Telegra
                               plain-text reply  ◀───────────────────────┘
 ```
 
+> **Looking for the ERPNext version?** It lives in [`erpnext/`](erpnext/README.md) (branch `erpnext-dev`): same idea, built on ERPNext v15 with per-user API keys, a structured Sales Activity log, and Claude or any OpenAI-compatible LLM. This README describes the Odoo version.
+
 > Design notes for contributors are in [`context.md`](context.md); sample prompts in [`DEMO_PROMPTS.md`](DEMO_PROMPTS.md); a possible future redesign (an Odoo module with per-user permissions) in [`plan.md`](plan.md).
 
 ## Contents
