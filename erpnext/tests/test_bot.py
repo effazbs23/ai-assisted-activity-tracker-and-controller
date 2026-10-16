@@ -138,3 +138,14 @@ def test_config_from_env(monkeypatch):
     monkeypatch.setenv("MIDDLEWARE_KEYS", "alice:ka,bob:kb")
     c = BotConfig.from_env()
     assert c.users == {"42": "alice", "43": "bob"} and c.keys == {"alice": "ka", "bob": "kb"} and c.allowed_user_ids == {"42", "43"}
+
+
+def test_voice_language_defaults_to_english(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_USERS", "42:alice")
+    monkeypatch.setenv("MIDDLEWARE_KEYS", "alice:ka")
+    monkeypatch.delenv("STT_LANGUAGE", raising=False)
+    assert BotConfig.from_env().stt_language == "en"
+    assert BotConfig("t", "k", {}, {}).stt_language == "en"
+    monkeypatch.setenv("STT_LANGUAGE", "ar")
+    assert BotConfig.from_env().stt_language == "ar"

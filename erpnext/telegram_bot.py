@@ -29,7 +29,7 @@ class BotConfig:
     keys: dict[str, str]           # middleware caller -> API key
     stt_base_url: str = "https://api.groq.com/openai/v1"
     stt_model: str = "whisper-large-v3"
-    stt_language: str = ""
+    stt_language: str = "en"   # English by default; auto-detect can mistake it for another language
 
     @property
     def allowed_user_ids(self) -> set[str]:
@@ -44,7 +44,7 @@ class BotConfig:
         return cls(need("TELEGRAM_BOT_TOKEN"), os.environ.get("STT_API_KEY", "").strip(),
                    _pairs(need("TELEGRAM_USERS")), _pairs(need("MIDDLEWARE_KEYS")),
                    os.environ.get("STT_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"),
-                   os.environ.get("STT_MODEL", "whisper-large-v3"), os.environ.get("STT_LANGUAGE", ""))
+                   os.environ.get("STT_MODEL", "whisper-large-v3"), os.environ.get("STT_LANGUAGE", "en").strip())
 
 
 def _pairs(raw: str) -> dict[str, str]:
@@ -214,7 +214,12 @@ def main():
                     bot.handle(update["message"])
         except KeyboardInterrupt:
             break
-        except Exception:
+        except Exception as exc:
+            if "(409)" in str(exc):  # Telegram allows one getUpdates poller per token
+                LOG.warning("Another process is polling this bot token (HTTP 409). Stop the other bot "
+                            "(for example the Odoo project's bot, or a second copy of this one) or use a separate token.")
+                time.sleep(10)
+                continue
             LOG.exception("Polling error")
             time.sleep(3)
 
