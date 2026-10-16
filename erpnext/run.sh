@@ -8,6 +8,7 @@
 #   ./run.sh seed         load demo data (idempotent)
 #   ./run.sh test         offline tests, then live tests against ERPNext
 #   ./run.sh smoke        start the API, call real endpoints, send one chat prompt if an LLM key is configured
+#   ./run.sh up           (re)start ERPNext, the API and, if a bot token is set, the Telegram bot, all in the background
 #   ./run.sh serve        run the API in the foreground (http://localhost:8100/docs)
 #   ./run.sh bot          run the Telegram bot in the foreground
 #   ./run.sh stop         stop the processes started by this script
@@ -225,6 +226,7 @@ start_erpnext() {
 stop_all() {
   log "Stopping processes started by this script"
   for n in api bot erp-web erp-schedule erp-worker; do stop_proc "$n"; done
+  stop_own_bot
   warn "Redis instances and MariaDB were left running (they may be shared). Stop bench redis with: redis-cli -p <port> shutdown nosave"
 }
 
@@ -326,6 +328,49 @@ EOF
   log "Smoke test passed"
 }
 
+own_bot_pids() {  # pids of THIS project's bot (any way it was started), never other projects' bots or unrelated shells
+  local pid cmd
+  for pid in $(pgrep -f "telegram_bot\.py" || true); do
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    if [[ $cmd == *python*" telegram_bot.py"* && $cmd != /bin/bash* && $(readlink "/proc/$pid/cwd" 2>/dev/null) == "$SCRIPT_DIR" ]]; then
+      echo "$pid"
+    fi
+  done
+  return 0
+}
+
+stop_own_bot() {
+  local pids; pids=$(own_bot_pids)
+  [[ -z $pids ]] && return 0
+  # shellcheck disable=SC2086
+  kill $pids 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -z $(own_bot_pids) ]] && return 0; sleep 0.5; done
+  # shellcheck disable=SC2046
+  kill -9 $(own_bot_pids) 2>/dev/null || true
+}
+
+up() {
+  erp_up || start_erpnext
+  [[ -f $SCRIPT_DIR/.env ]] || die ".env is missing. Run: ./run.sh prepare"
+  log "Restarting the API so it picks up the latest code and .env"
+  stop_proc api; stop_proc bot
+  if [[ -n $(own_bot_pids) ]]; then log "Stopping the running copy of this project's bot"; stop_own_bot; fi
+  sleep 1
+  start_api
+  log "API is up: http://localhost:$API_PORT/docs (log: $RUN_DIR/api.log)"
+  if [[ -n $(env_value TELEGRAM_BOT_TOKEN) ]]; then
+    if pgrep -f "[p]ython[0-9.]* telegram_bot\.py" >/dev/null && [[ -z $(own_bot_pids) ]]; then
+      warn "Another telegram_bot.py process (not this project's, maybe the Odoo bot) is already running. Stop it first, then run ./run.sh up again; two pollers share one token."
+    else
+      spawn bot "$SCRIPT_DIR" "$VENV/bin/python" telegram_bot.py
+      sleep 2
+      kill -0 "$(cat "$RUN_DIR/bot.pid")" 2>/dev/null && log "Telegram bot is up (log: $RUN_DIR/bot.log)" || warn "The bot exited; see $RUN_DIR/bot.log"
+    fi
+  else
+    warn "TELEGRAM_BOT_TOKEN is not set, so the bot was not started."
+  fi
+}
+
 serve() {
   [[ -f $SCRIPT_DIR/.env ]] || die ".env is missing. Run: ./run.sh prepare"
   erp_up || start_erpnext
@@ -339,6 +384,10 @@ bot() {
   [[ -f $SCRIPT_DIR/.env ]] || die ".env is missing. Run: ./run.sh prepare"
   [[ -n $(env_value TELEGRAM_BOT_TOKEN) ]] || die "Set TELEGRAM_BOT_TOKEN and TELEGRAM_USERS in .env first (see .env.example)."
   api_up || start_api
+  if [[ -n $(own_bot_pids) ]]; then
+    warn "This project's bot is already running in the background; stopping it so the foreground copy does not conflict (Telegram allows one poller per token)."
+    stop_proc bot; stop_own_bot
+  fi
   cd "$SCRIPT_DIR"
   exec "$VENV/bin/python" telegram_bot.py "$@"
 }
@@ -377,10 +426,11 @@ case "${1:-all}" in
   seed)      seed ;;
   test)      run_tests ;;
   smoke)     smoke ;;
+  up)        up ;;
   serve)     serve ;;
   bot)       shift || true; bot "$@" ;;
   stop)      stop_all ;;
   status)    status ;;
-  -h|--help|help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
   *)         die "Unknown command '$1'. Try: ./run.sh help" ;;
 esac
