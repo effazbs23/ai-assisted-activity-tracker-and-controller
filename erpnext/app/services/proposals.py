@@ -122,3 +122,15 @@ def _stage(erp, value: str) -> str:
         if s.lower() == value.strip().lower():
             return s
     raise ValidationFailed(f"sales_stage must be one of: {', '.join(stages)}")
+
+
+def mcp_call(st, caller, full_name: str, arguments: dict | None, key=None):
+    """Park a non-read-only MCP tool call. It runs only after the user's yes, like every other write."""
+    hub = getattr(st, "mcp", None)
+    meta = hub.describe(full_name) if hub else None
+    if not meta:
+        raise NotFound(f"MCP tool {full_name} is not available")
+    if not isinstance(arguments, dict):
+        raise ValidationFailed("MCP tool arguments must be an object")
+    return _record(st, caller, "mcp_call", {"tool_name": full_name, "server": meta["server"], "tool": meta["tool"],
+                                            "arguments": arguments}, key)

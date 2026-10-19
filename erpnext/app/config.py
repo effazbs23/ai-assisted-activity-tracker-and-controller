@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.agent.mcp import parse_mcp_servers
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -54,6 +56,9 @@ class Settings:
     llm_fallback_models: list[str] = field(default_factory=list)
     llm_temperature: str = "0"
     llm_effort: str = "medium"
+    # MCP fallback servers (name -> command); empty = the built-in tools are the only capability
+    mcp_servers: dict[str, str] = field(default_factory=dict)
+    mcp_timeout: float = 60.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -84,4 +89,6 @@ class Settings:
             llm_fallback_models=[m.strip() for m in env("LLM_FALLBACK_MODELS", "").split(",") if m.strip()],
             llm_temperature=env("LLM_TEMPERATURE", "0"),
             llm_effort=env("LLM_EFFORT", "medium"),
+            mcp_servers=parse_mcp_servers(env("MCP_SERVERS", "")),
+            mcp_timeout=float(env("MCP_TIMEOUT", "60")),
         )

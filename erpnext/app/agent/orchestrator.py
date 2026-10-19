@@ -5,16 +5,22 @@ import json
 import re
 from zoneinfo import ZoneInfo
 
+from app.agent.mcp import MCPError
 from app.agent.tools import TOOLS, run_tool
 from app.erp.client import ERPError
-from app.services import executor, sales
+from app.services import executor, proposals, sales
 from app.services.errors import NotFound, ValidationFailed
 
 YES = re.compile(r"^\s*(yes|y|yeah|yep|confirm|confirmed|ok|okay|sure|do it|go ahead)\W*$", re.I)
 NO = re.compile(r"^\s*(no|n|nope|cancel|stop|abort|never ?mind)\W*$", re.I)
 ASKS_CONFIRM = re.compile(r"\b(reply|say|respond)\b.{0,40}\byes\b|\bconfirm\b.{0,30}\?", re.I | re.S)
 REJECT = re.compile(r"^\s*(no|nope|nah|not (that|it|this|them)|neither|none|different|a different|another|new)\b", re.I)
+# A final reply that admits the built-in tools cannot do the job unlocks the MCP fallback.
+UNABLE = re.compile(r"\b(can(?:not|'t)|cannot|unable to|not able to|i don'?t have|i do not have|"
+                    r"no (?:tool|way)|doesn'?t (?:support|allow)|does not (?:support|allow)|"
+                    r"outside (?:my|the|these)|not something i|isn'?t something)\b", re.I)
 MAX_STEPS = 6
+MAX_MCP_STEPS = 6
 MAX_TOOL_RESULT_CHARS = 4000
 
 SYSTEM = """You are a sales activity assistant connected to ERPNext (Leads, Opportunities, Quotations, Sales Orders) for a sales team.
@@ -50,9 +56,20 @@ Rules:
   proposing anything. If the user says NO to a suggestion, never suggest it again.
 - Questions ("What quotations did we send last month?", "Show orders finalized this week") are answered from the list_* and
   sales_summary tools. Turn relative periods into exact dates from the current time. Report counts and totals from the tools only.
+- If a request is simply outside what your tools can do (a doctype or operation you have no tool for), say so briefly and honestly
+  instead of inventing an answer; extended tools may then become available for it.
 - Always reply in English unless the user clearly writes in another language.
 - Replies are sent to a chat app as plain text: no markdown tables, no bold, short lines.
 Known from this conversation: {entities}"""
+
+MCP_NOTE = ("Extra capability: requests outside the built-in tools can fall back to MCP servers ({servers}); their tools "
+            "then appear with names starting mcp__. If you cannot fulfil a request with the tools you have, say so briefly "
+            "and honestly instead of inventing an answer.")
+
+MCP_FALLBACK = ("[system] The built-in tools cannot handle this request. Extended MCP tools are now available (names start "
+                "with mcp__). Use them to help the user. Read-only MCP tools run immediately; any other MCP tool only "
+                "PROPOSES the call and the user must reply yes before it runs. Do not apologise; call the right tool now, "
+                "or ask one short clarifying question.")
 
 
 class Orchestrator:
@@ -113,6 +130,8 @@ class Orchestrator:
             return f"Opportunity {r['id']} created for {r['party_name']} (stage {r.get('sales_stage')})."
         if kind == "update_opportunity":
             return f"Opportunity {r['id']} updated (stage {r.get('sales_stage')}, status {r.get('status')})."
+        if kind == "mcp_call":
+            return f"MCP tool {r['server']}.{r['tool']} ran. {str(r.get('content', ''))[:300]}"
         return "Done."
 
     # -- main entry ---------------------------------------------------------------------------
@@ -135,12 +154,39 @@ class Orchestrator:
                                now=dt.datetime.now(ZoneInfo(tz)).strftime("%A %Y-%m-%d %H:%M"), tz=tz,
                                entities=json.dumps(session.entities) if session.entities else "nothing yet")
         messages = [{"role": "system", "content": system}, *session.messages]
-        pending, failed, nudged = None, [], False
+        mcp = getattr(st, "mcp", None)
+        extended = mcp.tools() if mcp else []
+        if extended:
+            messages.append({"role": "system", "content": MCP_NOTE.format(servers=", ".join(mcp.names))})
         fuzzy: set = set()  # records only *suggested* this turn; unusable for writes until the user answers
+        # Phase 1: the built-in tools are the main controller.
+        reply, pending, failed, fuzzy, exhausted = self._run(caller, session, messages, TOOLS, fuzzy)
+        # Phase 2: the request the main controller cannot handle falls back to the MCP servers.
+        if extended and not pending and (exhausted or UNABLE.search(reply or "")):
+            messages.append({"role": "assistant", "content": reply})
+            messages.append({"role": "user", "content": MCP_FALLBACK})
+            reply, pending, failed, fuzzy, _ = self._run(caller, session, messages, TOOLS + extended, fuzzy, mcp=mcp)
+        if not pending and ASKS_CONFIRM.search(reply):
+            # The model must never ask for a "yes" when nothing is actually waiting for confirmation.
+            reply = (f"I could not set that up: {failed[-1].split(': ', 1)[-1]}. Nothing was changed." if failed else
+                     "I could not prepare that action. Please rephrase with the client and what happened. Nothing was changed.")
+        if pending and (notice := self._new_item_notice(pending)) and notice not in reply:
+            reply = f"{reply}\n{notice}"  # stated by code, so the user always sees what will be created
+        session.suggested = set(fuzzy)  # what the user is being asked about right now
+        st.sessions.add(session, "assistant", reply)
+        return {"reply": reply, "pending_action": (
+            {"id": pending.id, "kind": pending.kind, "preview": pending.payload} if pending else None)}
+
+    # -- one tool-looping phase ---------------------------------------------------------------
+    def _run(self, caller, session, messages, tools, fuzzy: set, mcp=None) -> tuple:
+        """Loop the LLM over `tools` until it answers without tool calls. Returns
+        (reply, pending_action, failed_proposals, fuzzy_set, steps_exhausted)."""
+        st = self.st
+        pending, failed, nudged, exhausted = None, [], False, False
         for _ in range(MAX_STEPS):
-            msg = self.llm.chat(messages, TOOLS)
+            msg = self.llm.chat(messages, tools)
             if not msg.get("tool_calls") and not (msg.get("content") or "").strip():
-                msg = self.llm.chat(messages, TOOLS)  # models occasionally return nothing; retry once
+                msg = self.llm.chat(messages, tools)  # models occasionally return nothing; retry once
             calls = msg.get("tool_calls") or []
             if not calls:
                 reply = (msg.get("content") or "").strip() or "Sorry, I did not understand that."
@@ -153,7 +199,7 @@ class Orchestrator:
                         "confirmation. Call the correct propose_* tool now (search first if you need ids), or ask a "
                         "clarifying question without asking for yes/no.")})
                     continue
-                break
+                return reply, pending, failed, fuzzy, False
             messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls,
                              **({"_raw": msg["_raw"]} if msg.get("_raw") else {})})
             for call in calls:
@@ -161,8 +207,12 @@ class Orchestrator:
                     args = json.loads(call["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                out = run_tool(st, caller, call["function"]["name"], args, limit=min(10, st.settings.max_page_size), fuzzy=fuzzy,
-                               rejected=session.rejected)
+                name = call["function"]["name"]
+                if name.startswith("mcp__") and mcp is not None:
+                    out = self._run_mcp(caller, mcp, name, args)
+                else:
+                    out = run_tool(st, caller, name, args, limit=min(10, st.settings.max_page_size), fuzzy=fuzzy,
+                                   rejected=session.rejected)
                 if out.get("action"):
                     if session.pending_action_id:  # a newer proposal supersedes the old one
                         old = st.actions.get(session.pending_action_id, caller)
@@ -170,23 +220,27 @@ class Orchestrator:
                             old.status = "cancelled"
                     pending = out["action"]
                     session.pending_action_id = pending.id
-                if out.get("error") and call["function"]["name"].startswith("propose_"):
+                if out.get("error") and (name.startswith("propose_") or name.startswith("mcp__")):
                     failed.append(out["error"])
-                self._remember(session, call["function"]["name"], out)
+                self._remember(session, name, out)
                 body = json.dumps(out.get("data", out), default=str)[:MAX_TOOL_RESULT_CHARS]
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": body})
         else:
+            exhausted = True
             reply = "That took too many steps. Please try a simpler request."
-        if not pending and ASKS_CONFIRM.search(reply):
-            # The model must never ask for a "yes" when nothing is actually waiting for confirmation.
-            reply = (f"I could not set that up: {failed[-1].split(': ', 1)[-1]}. Nothing was changed." if failed else
-                     "I could not prepare that action. Please rephrase with the client and what happened. Nothing was changed.")
-        if pending and (notice := self._new_item_notice(pending)) and notice not in reply:
-            reply = f"{reply}\n{notice}"  # stated by code, so the user always sees what will be created
-        session.suggested = set(fuzzy)  # what the user is being asked about right now
-        st.sessions.add(session, "assistant", reply)
-        return {"reply": reply, "pending_action": (
-            {"id": pending.id, "kind": pending.kind, "preview": pending.payload} if pending else None)}
+        return reply, pending, failed, fuzzy, exhausted
+
+    def _run_mcp(self, caller, mcp, name: str, args: dict) -> dict:
+        """An MCP tool call: read-only ones run now; anything else is parked as a pending action."""
+        try:
+            if mcp.is_read_only(name):
+                return {"data": mcp.call(name, args)}
+            action = proposals.mcp_call(self.st, caller, name, args)
+            return {"data": {"status": "awaiting_user_confirmation", "preview": action.payload}, "action": action}
+        except MCPError as exc:
+            return {"error": f"MCP: {exc}"}
+        except (NotFound, ValidationFailed, PermissionError) as exc:
+            return {"error": f"ValidationFailed: {exc}"}
 
     @staticmethod
     def _new_item_notice(action) -> str:

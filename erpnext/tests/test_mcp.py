@@ -1,0 +1,206 @@
+"""MCP fallback: the stdio client against a real child process, and the orchestrator's two-phase behaviour."""
+import json
+import shlex
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.agent.mcp import MCPError, MCPHub, parse_mcp_servers
+from app.config import Settings
+from app.main import create_app
+from tests.conftest import tool_call
+from tests.stub_erp import StubERPNext, by_caller
+
+SERVER = Path(__file__).with_name("fake_mcp_server.py")
+
+
+def command(log: Path) -> str:
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(SERVER))} {shlex.quote(str(log))}"
+
+
+def calls(log: Path) -> list[dict]:
+    return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+
+
+class RecordingLLM:
+    """Scripted replies; records the tool names offered on every call."""
+    def __init__(self):
+        self.queue, self.offered, self.seen = [], [], []
+
+    def chat(self, messages, tools):
+        self.offered.append([t["function"]["name"] for t in tools])
+        self.seen.append(list(messages))
+        return self.queue.pop(0)
+
+
+def reply(text):
+    return {"content": text, "tool_calls": []}
+
+
+@pytest.fixture
+def hub(tmp_path):
+    h = MCPHub({"fake": command(tmp_path / "calls.log")}, timeout=10)
+    yield h, tmp_path / "calls.log"
+    h.close()
+
+
+@pytest.fixture
+def app_ctx(tmp_path):
+    log = tmp_path / "calls.log"
+    settings = Settings(api_keys={"k1": "alice"}, audit_log_path=str(tmp_path / "audit.log"), rate_limit_per_minute=1000,
+                        mcp_servers={"fake": command(log)}, mcp_timeout=10)
+    llm = RecordingLLM()
+    app = create_app(settings, by_caller(alice=StubERPNext("alice@example.com")), llm)
+    with TestClient(app) as client:  # context manager runs the lifespan, which closes the MCP servers
+        yield client, llm, log, app
+    assert all(c.proc is None for c in app.state.mcp._conns.values())
+
+
+def prompt(client, text):
+    r = client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": text, "session_id": "s"})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+# -- config ----------------------------------------------------------------------------------------
+def test_parse_mcp_servers():
+    assert parse_mcp_servers("a=cmd x; b = other --flag ;bad; c__d=nope; =x; e=") == {"a": "cmd x", "b": "other --flag"}
+
+
+def test_settings_read_mcp_env(monkeypatch):
+    monkeypatch.setenv("MCP_SERVERS", "fs=npx -y server-fs /tmp")
+    monkeypatch.setenv("MCP_TIMEOUT", "5")
+    s = Settings.from_env()
+    assert s.mcp_servers == {"fs": "npx -y server-fs /tmp"} and s.mcp_timeout == 5
+
+
+def test_no_servers_means_no_hub(tmp_path):
+    app = create_app(Settings(audit_log_path=str(tmp_path / "a.log")), by_caller(), RecordingLLM())
+    assert app.state.mcp is None
+
+
+# -- the stdio client ------------------------------------------------------------------------------
+def test_hub_lists_paginated_tools_and_classifies_reads(hub):
+    h, _ = hub
+    names = {t["function"]["name"] for t in h.tools()}
+    assert names == {f"mcp__fake__{n}" for n in ("get_weather", "create_note", "lookup", "wipe_all", "checkout_cart", "get_broken")}
+    assert h.is_read_only("mcp__fake__get_weather")      # name prefix
+    assert h.is_read_only("mcp__fake__lookup")           # readOnlyHint annotation
+    assert not h.is_read_only("mcp__fake__create_note")  # unknown verb = write
+    assert not h.is_read_only("mcp__fake__wipe_all")     # destructiveHint beats readOnlyHint
+    assert not h.is_read_only("mcp__fake__checkout_cart")  # 'check' prefix needs an underscore
+
+
+def test_hub_calls_a_tool_and_skips_notifications(hub):
+    h, log = hub
+    out = h.call("mcp__fake__get_weather", {"city": "Muscat"})
+    assert out == {"server": "fake", "tool": "get_weather", "content": "Sunny in Muscat"}
+    assert calls(log) == [{"name": "get_weather", "arguments": {"city": "Muscat"}}]
+
+
+def test_hub_reports_tool_errors_and_unknown_tools(hub):
+    h, _ = hub
+    with pytest.raises(MCPError, match="backend down"):
+        h.call("mcp__fake__get_broken", {})
+    with pytest.raises(MCPError, match="unknown MCP tool"):
+        h.call("mcp__fake__nope", {})
+
+
+def test_hub_restarts_a_server_that_exited(hub):
+    h, _ = hub
+    h.tools()
+    h._conns["fake"].proc.kill()
+    h._conns["fake"].proc.wait()
+    assert h.call("mcp__fake__lookup", {})["content"] == "lookup ok"
+
+
+def test_broken_server_is_skipped_and_backed_off(tmp_path):
+    h = MCPHub({"bad": "/definitely/not/a/command", "fake": command(tmp_path / "c.log")}, timeout=10)
+    try:
+        names = {t["function"]["name"] for t in h.tools()}
+        assert names and all(n.startswith("mcp__fake__") for n in names)
+        assert "bad" in h._broken_until
+    finally:
+        h.close()
+
+
+# -- orchestrator: phase 1 first, MCP only as a fallback ------------------------------------------------
+def test_builtin_tools_handle_request_without_mcp(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("You have no meetings today.")]
+    out = prompt(client, "Any meetings today?")
+    assert out["reply"] == "You have no meetings today."
+    assert len(llm.offered) == 1 and not any(n.startswith("mcp__") for n in llm.offered[0])
+    assert calls(log) == []
+
+
+def test_unable_reply_falls_back_to_read_only_mcp_tool(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("I can't check the weather with my tools."),
+                 tool_call("mcp__fake__get_weather", {"city": "Muscat"}),
+                 reply("It is sunny in Muscat.")]
+    out = prompt(client, "What's the weather in Muscat?")
+    assert out["reply"] == "It is sunny in Muscat." and out["pending_action"] is None
+    assert any(n.startswith("mcp__") for n in llm.offered[1])  # phase 2 offers the MCP tools
+    assert calls(log) == [{"name": "get_weather", "arguments": {"city": "Muscat"}}]  # a read runs at once
+
+
+def test_mcp_write_waits_for_yes(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("I cannot create notes."),
+                 tool_call("mcp__fake__create_note", {"text": "call back Nizwa"}),
+                 reply("I will create the note 'call back Nizwa'. Reply yes or no.")]
+    out = prompt(client, "Make a note: call back Nizwa")
+    assert out["pending_action"]["kind"] == "mcp_call"
+    assert out["pending_action"]["preview"]["arguments"] == {"text": "call back Nizwa"}
+    assert calls(log) == []  # nothing ran yet
+    done = prompt(client, "yes")
+    assert done["reply"].startswith("Done. MCP tool fake.create_note ran. create_note ok")
+    assert calls(log) == [{"name": "create_note", "arguments": {"text": "call back Nizwa"}}]
+
+
+def test_mcp_write_cancelled_with_no(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("I'm unable to do that."), tool_call("mcp__fake__wipe_all", {}),
+                 reply("This will wipe everything. Reply yes or no.")]
+    assert prompt(client, "wipe it all")["pending_action"]["kind"] == "mcp_call"  # destructive => needs yes
+    assert prompt(client, "no")["reply"].startswith("Cancelled")
+    assert calls(log) == []
+
+
+def test_mcp_write_can_be_confirmed_over_rest(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("I cannot do that."), tool_call("mcp__fake__create_note", {"text": "x"}),
+                 reply("Reply yes or no.")]
+    action = prompt(client, "note x")["pending_action"]
+    r = client.post(f"/v1/actions/{action['id']}/confirm", headers={"X-API-Key": "k1"})
+    assert r.status_code == 200 and r.json()["result"]["content"] == "create_note ok"
+    assert len(calls(log)) == 1
+
+
+def test_failing_mcp_read_is_reported_not_hidden(app_ctx):
+    client, llm, _, _ = app_ctx
+    llm.queue = [reply("I can't do that."), tool_call("mcp__fake__get_broken", {}),
+                 reply("The external service failed: backend down.")]
+    prompt(client, "use the broken thing")
+    tool_msgs = [m for m in llm.seen[-1] if m["role"] == "tool"]
+    assert "MCP: backend down" in tool_msgs[-1]["content"]  # the model is told the real error
+
+
+def test_mcp_tools_are_not_callable_in_phase_one(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [tool_call("mcp__fake__create_note", {"text": "sneaky"}), reply("Sorry, that tool is unknown.")]
+    prompt(client, "note sneaky")
+    assert calls(log) == []  # phase 1 routes mcp__ names to the built-in dispatcher, which refuses them
+
+
+def test_no_fallback_when_nothing_configured(tmp_path):
+    llm = RecordingLLM()
+    app = create_app(Settings(api_keys={"k1": "alice"}, audit_log_path=str(tmp_path / "a.log"), rate_limit_per_minute=1000),
+                     by_caller(alice=StubERPNext("alice@example.com")), llm)
+    llm.queue = [reply("I can't check the weather.")]
+    with TestClient(app) as client:
+        assert prompt(client, "weather?")["reply"] == "I can't check the weather."
+    assert len(llm.offered) == 1

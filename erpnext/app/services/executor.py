@@ -1,6 +1,7 @@
 """Executes a confirmed pending action against ERPNext. Single place that performs writes."""
 from __future__ import annotations
 
+from app.agent.mcp import MCPError
 from app.services import activities, sales
 from app.services.errors import ValidationFailed
 from app.store.actions import PendingAction
@@ -35,4 +36,12 @@ def execute(state, action: PendingAction) -> dict:
         saved = erp.update("Opportunity", p["opportunity_id"], p["changes"])
         return {"id": saved["name"], "party_name": p["party_name"], "status": saved.get("status"),
                 "sales_stage": saved.get("sales_stage"), "amount": saved.get("opportunity_amount")}
+    if action.kind == "mcp_call":
+        hub = getattr(state, "mcp", None)
+        if hub is None:
+            raise ValidationFailed("MCP fallback is not configured")
+        try:
+            return hub.call(p["tool_name"], p["arguments"])
+        except MCPError as exc:
+            raise ValidationFailed(f"MCP tool {p['server']}.{p['tool']} failed: {exc}") from exc
     raise ValidationFailed(f"Unknown action kind {action.kind}")

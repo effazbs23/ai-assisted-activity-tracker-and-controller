@@ -252,6 +252,7 @@ All settings come from environment variables; a `.env` in this directory is load
 | LLM | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL`, `LLM_FALLBACK_MODELS`, `LLM_TEMPERATURE`, `LLM_EFFORT` |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USERS` (`telegram_id:caller`), `MIDDLEWARE_URL`, `MIDDLEWARE_KEYS` (`caller:api_key`) |
 | Speech-to-text | `STT_API_KEY`, `STT_BASE_URL`, `STT_MODEL`, `STT_LANGUAGE` (default `en`; `ar` for Arabic; empty = auto-detect) |
+| MCP fallback | `MCP_SERVERS` (`name=command; name2=command`), `MCP_TIMEOUT` (60) |
 
 Keep three mappings consistent: `API_KEYS` (`key:caller`) and `MIDDLEWARE_KEYS` (`caller:key`) hold the same keys in opposite order, and every caller must also appear in `ERP_USERS`.
 
@@ -309,6 +310,21 @@ Read tools run immediately. Write tools only **propose**; the user must confirm.
 
 Guards in code (not left to the model): names that are only close matches are blocked from writes until the user confirms them; rejected suggestions are never offered again; the model cannot ask for "yes" unless a real action is pending; tool results are capped at 4,000 characters; quantities are bounded (0 to 10,000); dates must be valid and not in the past where that matters.
 
+### MCP fallback (optional)
+
+For requests the tools above cannot handle, the assistant can fall back to external [MCP](https://modelcontextprotocol.io) servers. Configure stdio servers in `.env`:
+
+```bash
+MCP_SERVERS=fetch=uvx mcp-server-fetch; time=uvx mcp-server-time --local-timezone Asia/Muscat
+MCP_TIMEOUT=60
+```
+
+How it behaves (`app/agent/mcp.py`, `app/agent/orchestrator.py`):
+- **Built-in tools first.** Each prompt runs with the ERPNext tools only. MCP tools (named `mcp__<server>__<tool>`) are offered in a second pass only when nothing was proposed and the model said it cannot do the request, or ran out of steps.
+- **Reads run, writes wait for "yes".** A tool is read-only if its MCP `readOnlyHint` says so (a `destructiveHint` always makes it a write), or, without annotations, if its name starts with `get_`, `list_`, `search_`, `read_`, `find_`, `lookup_` and similar. Every other MCP call becomes a pending action of kind `mcp_call`, shown as a preview and executed by `executor.py` after **yes** (or `POST /v1/actions/{id}/confirm`).
+- **Servers start lazily** on the first fallback, are restarted if they exit, are skipped for 60 s if they fail to start, and are stopped when the API shuts down. Tool output is capped at 4,000 characters.
+- MCP servers act with **their own credentials**, not the caller's ERPNext user, so ERPNext permissions do not apply to them. Only add servers every caller may use.
+
 ## 13. REST API
 
 All `/v1/*` endpoints need `X-API-Key: <key>` and count against that caller's rate limit. Interactive docs: `/docs`.
@@ -357,6 +373,7 @@ Status codes: `401` bad key, `403` caller may not confirm Sales Orders, `404` no
 - **Telegram allow-list** by numeric user id; voice files are never downloaded for unlisted users.
 - **API-key auth**, a per-caller rate limit, and a JSON-lines `audit.log` of prompts (length only, not text), proposals, executions, cancellations and ERPNext errors.
 - **Secrets** live in `.env` (mode 600, git-ignored). Remove `ERP_ADMIN_*` from it after setup in production.
+- **MCP fallback** (off unless `MCP_SERVERS` is set): only used after the built-in tools decline; non-read-only MCP tools need **yes** like any other write. MCP servers bypass ERPNext permissions because they use their own credentials, and their output is untrusted text passed back to the model.
 - **Data sharing.** Customer names and activity notes are sent to the chosen LLM provider and, for voice, to the speech provider. Confirm that is acceptable under the client's data policy.
 
 ## 15. Demo data and demo prompts
@@ -391,8 +408,8 @@ venv/bin/pytest tests/live -v                 # against a running, seeded ERPNex
 venv/bin/pytest tests                         # everything
 ```
 
-- **Offline (67 tests):** agent conversations (confirmation, cancellation, fuzzy-name guards, permissions, session isolation), REST API (auth, idempotency, caller binding, error mapping, rate limit, audit log), services (search, previews, summaries, activity rules), both LLM adapters (request shapes, tool-call parsing, fallbacks, refusals) and the Telegram bot.
-- **Live (10 tests):** real ERPNext calls as each of the three users: authentication, fuzzy search, ERPNext prices, summaries, own-vs-manager activity visibility, the quotation → submit → order → confirm lifecycle, opportunity create/update, and error mapping. They **delete the records they create**, using the administrator login in `.env`. They skip automatically when ERPNext or the credentials are missing.
+- **Offline (111 tests):** agent conversations (confirmation, cancellation, fuzzy-name guards, permissions, session isolation), REST API (auth, idempotency, caller binding, error mapping, rate limit, audit log), services (search, previews, summaries, activity rules), both LLM adapters (request shapes, tool-call parsing, fallbacks, refusals), the MCP fallback (stdio client against a fake server, read/write classification, yes-gate, restart, shutdown) and the Telegram bot.
+- **Live (13 tests):** real ERPNext calls as each of the three users: authentication, fuzzy search, ERPNext prices, summaries, own-vs-manager activity visibility, the quotation → submit → order → confirm lifecycle, opportunity create/update, and error mapping. They **delete the records they create**, using the administrator login in `.env`. They skip automatically when ERPNext or the credentials are missing.
 
 ## 17. Troubleshooting
 
