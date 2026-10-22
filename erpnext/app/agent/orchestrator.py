@@ -20,7 +20,6 @@ UNABLE = re.compile(r"\b(can(?:not|['’]t)|cannot|unable to|not able to|i don['
                     r"no (?:tool|way)|doesn['’]?t (?:support|allow)|does not (?:support|allow)|"
                     r"outside (?:my|the|these)|not something i|isn['’]?t something)\b", re.I)
 MAX_STEPS = 6
-MAX_MCP_STEPS = 6
 MAX_TOOL_RESULT_CHARS = 4000
 
 SYSTEM = """You are a sales activity assistant connected to ERPNext (Leads, Opportunities, Quotations, Sales Orders) for a sales team.

@@ -234,10 +234,6 @@ class MCPHub:
                                                       "parameters": t["input_schema"]}}
                     for t in self._tools.values()]
 
-    def knows(self, full_name: str) -> bool:
-        self.tools()
-        return full_name in self._tools
-
     def describe(self, full_name: str) -> dict | None:
         self.tools()
         meta = self._tools.get(full_name)
