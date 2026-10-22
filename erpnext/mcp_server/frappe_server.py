@@ -79,7 +79,15 @@ class Server:
         self._check(caller, dt, op)
         if name == "list_docs":
             limit = max(1, min(int(a.get("limit") or 20), self.settings.max_page_size))
-            return erp.get_list(dt, a.get("filters"), a.get("fields"), limit, a.get("order_by"))
+            try:
+                return erp.get_list(dt, a.get("filters"), a.get("fields"), limit, a.get("order_by"))
+            except ERPError as exc:
+                if "not permitted in query" not in str(exc):
+                    raise
+                # a guessed field name: list the real ones so the model fixes the call in one step
+                names = [f["fieldname"] for f in erp.doctype_meta(dt).get("fields", [])
+                         if f.get("fieldname") and "Break" not in f.get("fieldtype", "")]
+                raise ValueError(f"{exc}. Valid fields of {dt}: {', '.join(names)}") from exc
         if name == "count_docs":
             return erp.call("frappe.client.get_count", doctype=dt, filters=a.get("filters") or {})
         if name == "get_doc":

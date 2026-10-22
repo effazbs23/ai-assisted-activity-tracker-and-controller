@@ -252,7 +252,7 @@ All settings come from environment variables; a `.env` in this directory is load
 | LLM | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL`, `LLM_FALLBACK_MODELS`, `LLM_TEMPERATURE`, `LLM_EFFORT` |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_USERS` (`telegram_id:caller`), `MIDDLEWARE_URL`, `MIDDLEWARE_KEYS` (`caller:api_key`) |
 | Speech-to-text | `STT_API_KEY`, `STT_BASE_URL`, `STT_MODEL`, `STT_LANGUAGE` (default `en`; `ar` for Arabic; empty = auto-detect) |
-| MCP fallback | `MCP_SERVERS` (`name=command; name2=command`), `MCP_TIMEOUT` (60) |
+| MCP fallback | `MCP_SERVERS` (`name=command; name2=command`), `MCP_TIMEOUT` (60), `MCP_ROUTER` (1) |
 
 Keep three mappings consistent: `API_KEYS` (`key:caller`) and `MIDDLEWARE_KEYS` (`caller:key`) hold the same keys in opposite order, and every caller must also appear in `ERP_USERS`.
 

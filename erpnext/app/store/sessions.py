@@ -32,5 +32,6 @@ class SessionStore:
             return s
 
     def add(self, session: Session, role: str, content: str) -> None:
-        session.messages.append({"role": role, "content": content[:2000]})
+        # assistant replies (long lists, previews) are cut harder: the history is resent on every AI call
+        session.messages.append({"role": role, "content": content[:500 if role == "assistant" else 2000]})
         del session.messages[:-self.max_messages]

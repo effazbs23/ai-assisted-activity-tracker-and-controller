@@ -16,6 +16,14 @@ class LLM(Protocol):
         """Return the assistant message dict: {'content': str, 'tool_calls': [{'id', 'function': {'name', 'arguments'}}]}."""
 
 
+class RateLimited(RuntimeError):
+    """Every model answered 429. `wait` is the provider's retry-after in seconds (a default when it sent none)."""
+
+    def __init__(self, message: str, wait: float):
+        super().__init__(message)
+        self.wait = wait
+
+
 class OpenAICompatLLM:
     """OpenAI, Groq, Azure OpenAI, OpenRouter, Ollama... anything serving /chat/completions with tool calling."""
 
@@ -26,6 +34,7 @@ class OpenAICompatLLM:
         self.fallbacks = [m for m in (fallbacks or []) if m != model]
         self.temperature, self.max_tokens = temperature, max_tokens
         self.http = session or requests.Session()
+        self.last_usage: dict | None = None  # token counts of the latest call, for the audit log
 
     def _body(self, model: str, messages: list[dict], tools: list[dict]) -> dict:
         clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
@@ -37,18 +46,38 @@ class OpenAICompatLLM:
         return body
 
     def chat(self, messages, tools):
-        errors = []
+        errors, rate_wait = [], 0.0
         for model in [self.model, *self.fallbacks]:
-            for attempt in (1, 2):  # one retry: 429s and malformed tool calls are usually transient
+            for attempt in (1, 2):  # one retry: malformed tool calls and brief 5xx are usually transient
                 r = self.http.post(f"{self.base}/chat/completions", timeout=60,
                                    headers={"Authorization": f"Bearer {self.key}"}, json=self._body(model, messages, tools))
                 if r.ok:
-                    return r.json()["choices"][0]["message"]
+                    body = r.json()
+                    self.last_usage = body.get("usage")
+                    return body["choices"][0]["message"]
                 errors.append(f"{model}#{attempt}: {r.status_code} {r.text[:160]}")
                 if r.status_code in (400, 401, 403, 404):
                     break  # retrying cannot help
+                if r.status_code == 429:
+                    wait = _retry_after(r)
+                    rate_wait = max(rate_wait, wait or 20.0)  # 20 s when the provider says nothing
+                    if wait > 3:
+                        break  # the token window will not reopen soon: try the next model's own bucket, do not sleep
+                    time.sleep(wait or 1.5)
+                    continue
                 time.sleep(1.5)
-        raise RuntimeError("LLM unavailable: " + " | ".join(errors[-4:]))
+        message = "LLM unavailable: " + " | ".join(errors[-4:])
+        if rate_wait:
+            raise RateLimited(message, rate_wait)
+        raise RuntimeError(message)
+
+
+def _retry_after(r) -> float:
+    """Seconds the provider asks us to wait (Retry-After header); 0 when it sent none."""
+    try:
+        return float((getattr(r, "headers", None) or {}).get("retry-after", 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def to_anthropic_messages(messages: list[dict]) -> list[dict]:
@@ -91,6 +120,7 @@ class AnthropicLLM:
             import anthropic
             client = anthropic.Anthropic(api_key=api_key or None)
         self.client, self.model, self.effort, self.max_tokens = client, model, effort, max_tokens
+        self.last_usage: dict | None = None
 
     def chat(self, messages, tools):
         kwargs: dict[str, Any] = {
@@ -106,6 +136,9 @@ class AnthropicLLM:
             resp = self.client.messages.create(**kwargs)
         except Exception as exc:  # SDK errors carry status and request id; keep the reason, not the stack
             raise RuntimeError(f"LLM unavailable: {type(exc).__name__}: {str(exc)[:200]}") from exc
+        usage = getattr(resp, "usage", None)
+        self.last_usage = ({"prompt_tokens": usage.input_tokens, "completion_tokens": usage.output_tokens}
+                           if usage is not None and hasattr(usage, "input_tokens") else None)
         if resp.stop_reason == "refusal":
             return {"content": "I cannot help with that request.", "tool_calls": []}
         text = "".join(b.text for b in resp.content if b.type == "text").strip()

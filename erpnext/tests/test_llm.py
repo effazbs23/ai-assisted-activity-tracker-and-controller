@@ -3,7 +3,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from app.agent.llm import AnthropicLLM, OpenAICompatLLM, build_llm, to_anthropic_messages
+from app.agent.llm import AnthropicLLM, OpenAICompatLLM, RateLimited, build_llm, to_anthropic_messages
 from app.agent.tools import TOOLS
 from app.config import Settings
 
@@ -141,3 +141,33 @@ def test_provider_selection(monkeypatch):
     assert isinstance(build_llm(Settings(llm_provider="groq")), OpenAICompatLLM)
     with pytest.raises(RuntimeError):
         build_llm(Settings(llm_provider="mystery"))
+
+
+class Resp429(Resp):
+    def __init__(self, retry_after=None):
+        super().__init__(429)
+        self.headers = {"retry-after": str(retry_after)} if retry_after is not None else {}
+
+
+def test_rate_limit_skips_to_the_fallback_model_without_sleeping_and_reports_the_wait(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    http = FakeHTTP(Resp429(40), Resp429(35))
+    with pytest.raises(RateLimited) as exc:
+        OpenAICompatLLM("k", "main", fallbacks=["backup"], session=http).chat([], TOOLS)
+    assert exc.value.wait == 40 and sleeps == [] and [r[2]["model"] for r in http.requests] == ["main", "backup"]
+
+
+def test_short_rate_limit_waits_then_retries_the_same_model(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    http = FakeHTTP(Resp429(1.5), OK)
+    assert OpenAICompatLLM("k", "main", session=http).chat([], TOOLS)["content"] == "hi"
+    assert sleeps == [1.5] and [r[2]["model"] for r in http.requests] == ["main", "main"]
+
+
+def test_usage_is_kept_for_the_audit_log():
+    http = FakeHTTP(Resp(200, {"choices": [{"message": {"content": "hi"}}], "usage": {"prompt_tokens": 1200, "completion_tokens": 30}}))
+    llm = OpenAICompatLLM("k", "main", session=http)
+    llm.chat([], TOOLS)
+    assert llm.last_usage == {"prompt_tokens": 1200, "completion_tokens": 30}

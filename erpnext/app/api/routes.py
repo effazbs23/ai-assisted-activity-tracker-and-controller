@@ -6,6 +6,7 @@ import requests
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field, model_validator
 
+from app.agent.llm import RateLimited
 from app.erp.client import ERPError
 from app.security import Caller
 from app.services import activities, executor, parties, proposals, sales
@@ -272,6 +273,8 @@ class PromptRequest(BaseModel):
 def prompt(body: PromptRequest, request: Request, caller: str = Caller):
     try:
         out = request.app.state.agent.handle(caller, body.session_id, body.message, body.force_mcp)
+    except RateLimited as exc:  # tell the caller when to retry instead of a bare "unavailable"
+        raise HTTPException(503, f"AI service busy: {exc}", headers={"Retry-After": str(int(exc.wait) + 1)})
     except (RuntimeError, requests.RequestException) as exc:
         raise HTTPException(503, f"AI service unavailable: {exc}")
     return {"session_id": body.session_id, **out}

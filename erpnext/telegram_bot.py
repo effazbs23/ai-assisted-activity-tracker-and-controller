@@ -198,6 +198,9 @@ class Bot:
             return "You are sending messages too quickly. Please wait a minute."
         if not r.ok:
             LOG.error("Middleware %s: %s", r.status_code, r.text[:300])
+            wait = (getattr(r, "headers", None) or {}).get("Retry-After")
+            if r.status_code == 503 and wait and str(wait).isdigit():
+                return f"The assistant is busy. Please try again in about {wait} seconds."
             return "The assistant is unavailable right now. Please try again shortly."
         return r.json()["reply"]
 

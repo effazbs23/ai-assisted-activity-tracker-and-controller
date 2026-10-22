@@ -50,7 +50,7 @@ def hub(tmp_path):
 def app_ctx(tmp_path):
     log = tmp_path / "calls.log"
     settings = Settings(api_keys={"k1": "alice"}, audit_log_path=str(tmp_path / "audit.log"), rate_limit_per_minute=1000,
-                        mcp_servers={"fake": command(log)}, mcp_timeout=10)
+                        mcp_servers={"fake": command(log)}, mcp_timeout=10, mcp_router=False)
     llm = RecordingLLM()
     app = create_app(settings, by_caller(alice=StubERPNext("alice@example.com")), llm)
     with TestClient(app) as client:  # context manager runs the lifespan, which closes the MCP servers
@@ -237,7 +237,7 @@ def test_force_mcp_skips_phase_1_and_offers_only_mcp_tools(app_ctx):
     llm.queue = [tool_call("mcp__fake__get_weather", {"city": "Muscat"}), reply("Sunny.")]
     r = client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "weather", "session_id": "s", "force_mcp": True})
     assert r.json()["reply"] == "Sunny."
-    assert all(n.startswith("mcp__") for n in llm.offered[0]) and llm.offered[0]  # no built-in tool was offered
+    assert llm.offered[0] and all(n.startswith("mcp__") or n in ("search_clients", "search_items") for n in llm.offered[0])
     assert [c["name"] for c in calls(log)] == ["get_weather"]
 
 
@@ -259,3 +259,58 @@ def test_a_failed_turn_leaves_no_stale_message_in_the_session(app_ctx):
     llm.queue = [reply("Hello.")]
     prompt(client, "show the stock balance report")
     assert not any("list all users" in str(m.get("content")) for m in llm.seen[0])
+
+
+def _router_ctx(tmp_path, router=True):
+    log = tmp_path / "calls.log"
+    settings = Settings(api_keys={"k1": "alice"}, audit_log_path=str(tmp_path / "audit.log"), rate_limit_per_minute=1000,
+                        mcp_servers={"fake": command(log)}, mcp_timeout=10, mcp_router=router)
+    llm = RecordingLLM()
+    return TestClient(create_app(settings, by_caller(alice=StubERPNext("alice@example.com")), llm)), llm
+
+
+def test_router_sends_non_sales_requests_straight_to_the_short_mcp_phase(tmp_path):
+    client, llm = _router_ctx(tmp_path)
+    llm.queue = [tool_call("mcp__fake__get_weather", {"city": "X"}), reply("Sunny.")]
+    with client:
+        r = client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "list all warehouses", "session_id": "s"})
+    assert r.json()["reply"] == "Sunny." and len(llm.offered) == 2  # no phase-1 call
+    assert all(n.startswith("mcp__") or n.startswith("search_") for n in llm.offered[0])
+    assert "sales activity assistant" not in llm.seen[0][0]["content"] and "mcp__" in llm.seen[0][0]["content"]
+
+
+def test_phase_2_after_a_refusal_starts_from_a_clean_short_context(tmp_path):
+    client, llm = _router_ctx(tmp_path)
+    llm.queue = [reply("I can't do that."), tool_call("mcp__fake__get_weather", {"city": "X"}), reply("Sunny.")]
+    with client:
+        client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "weather in X please", "session_id": "s"})
+    assert "sales activity assistant" in llm.seen[0][0]["content"]  # phase 1 keeps the sales prompt
+    assert "sales activity assistant" not in llm.seen[1][0]["content"]
+    assert not any("I can't do that" in str(m.get("content")) for m in llm.seen[1])  # the refusal is not resent
+
+
+def test_router_can_be_switched_off(tmp_path):
+    client, llm = _router_ctx(tmp_path, router=False)
+    llm.queue = [reply("Sorry, nothing.")]
+    with client:
+        client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "list all warehouses", "session_id": "s"})
+    assert any(not n.startswith("mcp__") for n in llm.offered[0]) and len(llm.offered) == 1
+
+
+def test_assistant_history_is_cut_but_user_history_is_not():
+    from app.store.sessions import SessionStore
+    store = SessionStore(60, 12)
+    s = store.get("a", "s")
+    store.add(s, "user", "u" * 1500)
+    store.add(s, "assistant", "a" * 1500)
+    assert [len(m["content"]) for m in s.messages] == [1500, 500]
+
+
+def test_token_usage_of_every_ai_call_is_audited(tmp_path):
+    client, llm = _router_ctx(tmp_path)
+    llm.last_usage = {"prompt_tokens": 1234, "completion_tokens": 7}
+    llm.queue = [reply("Hello.")]
+    with client:
+        client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "hello", "session_id": "s"})
+    lines = [json.loads(l) for l in (tmp_path / "audit.log").read_text().splitlines()]
+    assert {"event": "llm", "phase": "sales", "step": 1, "prompt_tokens": 1234, "completion_tokens": 7}.items() <= lines[-1].items()

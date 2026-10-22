@@ -21,6 +21,7 @@ UNABLE = re.compile(r"\b(can(?:not|['’]t)|cannot|unable to|not able to|i don['
                     r"outside (?:my|the|these)|not something i|isn['’]?t something)\b", re.I)
 MAX_STEPS = 6
 MAX_TOOL_RESULT_CHARS = 4000
+MAX_MCP_RESULT_CHARS = 2000
 
 SYSTEM = """You are a sales activity assistant connected to ERPNext (Leads, Opportunities, Quotations, Sales Orders) for a sales team.
 Current time: {now} ({tz}). Signed-in user: {user}.
@@ -61,21 +62,30 @@ Rules:
 - Replies are sent to a chat app as plain text: no markdown tables, no bold, short lines.
 Known from this conversation: {entities}"""
 
-MCP_NOTE = ("Extra capability: requests outside the built-in tools can fall back to MCP servers ({servers}); their tools "
-            "then appear with names starting mcp__. If you cannot fulfil a request with the tools you have, say so briefly "
-            "and honestly instead of inventing an answer. The 'frappe' server reaches any other ERPNext doctype (stock, HR, "
-            "accounting, projects, reports) as the current user: call mcp__frappe__describe_doctype before create_doc.")
+MCP_NOTE = ("Requests outside the built-in tools can fall back to extra ERPNext tools. If you cannot fulfil a request with "
+            "the tools you have, say so briefly and honestly instead of inventing an answer.")
 
-MCP_FORCED = ("[system] The user explicitly asked to use the MCP tools (names start with mcp__) for this request. Only those "
-              "tools are available now. Read-only MCP tools run immediately; any other MCP tool only PROPOSES the call and "
-              "the user must reply yes before it runs, so for a create/update/submit/cancel request call the tool right away. "
-              "Call the right tool now, or ask one short clarifying question only if a required detail is missing.")
+# The MCP phase has its own short prompt: the sales prompt (~1K tokens) and the built-in tool list (~2.3K) are resent on every
+# AI call and the provider's token-per-minute cap is small, so this phase offers only the MCP tools and two cheap lookups.
+MCP_SYSTEM = """You are an assistant for ERPNext. Signed-in user: {user}. Current time: {now} ({tz}).
+Use the mcp__ tools to read or change any ERPNext record as this user.
+- Read-only tools run now. Any other tool only PROPOSES the call and the user must reply yes before it runs, so for a
+  create/update/submit/cancel request call the tool right away; never ask in text whether to proceed.
+- Use real field names; if unsure, call mcp__frappe__describe_doctype first. Never invent records, ids or numbers.
+- You cannot delete records or change security settings; say so plainly.
+- Reply in English as plain text for a chat app: short lines, no tables or bold."""
+MCP_LOOKUPS = [t for t in TOOLS if t["function"]["name"] in ("search_clients", "search_items")]
 
-MCP_FALLBACK = ("[system] The built-in tools cannot handle this request. Extended MCP tools are now available (names start "
-                "with mcp__). Use them to help the user. Read-only MCP tools run immediately; any other MCP tool only "
-                "PROPOSES the call and the user must reply yes before it runs, so for a create/update/submit/cancel request call the "
-                "tool right away; never ask the user in text whether to proceed. Do not apologise; call the right tool now, "
-                "or ask one short clarifying question only if a required detail is missing.")
+# Requests that are clearly not sales skip phase 1. Anything with a sales word left over stays on the two-phase path.
+NON_SALES = re.compile(r"\b(warehouses?|stock|inventory|bins?|employees?|departments?|projects?|tasks?|invoices?|suppliers?|"
+                       r"notes?|to-?dos?|users?|reports?|ledger|territor\w*|price lists?|item groups?|customer groups?|"
+                       r"leave|payroll)\b", re.I)
+SALES = re.compile(r"\b(quotations?|quotes?|opportunit\w*|leads?|sales (?:orders?|summary|report|figures|total)|orders?|"
+                   r"activit\w*|meeting|met|called|follow(?:ed)? up|customers?|clients?|items?|prices?|summar\w*)\b", re.I)
+
+
+def is_non_sales(text: str) -> bool:
+    return bool(NON_SALES.search(text)) and not SALES.search(NON_SALES.sub(" ", text))
 
 
 def _bullets(value, prefix: str = "") -> list[str]:
@@ -181,32 +191,30 @@ class Orchestrator:
             st.sessions.add(session, "assistant", direct["reply"])
             return direct
 
-        tz = st.settings.timezone
-        system = SYSTEM.format(currency=self.currency(caller), user=caller,
-                               can_create="yes" if caller in st.settings.item_creators else "no",
-                               now=dt.datetime.now(ZoneInfo(tz)).strftime("%A %Y-%m-%d %H:%M"), tz=tz,
-                               entities=json.dumps(session.entities) if session.entities else "nothing yet")
-        messages = [{"role": "system", "content": system}, *session.messages]
         mcp = getattr(st, "mcp", None)
         extended = mcp.tools() if mcp else []
-        if extended:
-            messages.append({"role": "system", "content": MCP_NOTE.format(servers=", ".join(mcp.names))})
         fuzzy: set = set()  # records only *suggested* this turn; unusable for writes until the user answers
-        if force_mcp:  # /mcp: no phase 1, only the MCP tools
-            if not extended:
-                reply = "The extra ERPNext tools (MCP) are not enabled on this server."
-                st.sessions.add(session, "assistant", reply)
-                return {"reply": reply, "pending_action": None}
-            messages.append({"role": "user", "content": MCP_FORCED})
-            reply, pending, failed, fuzzy, _ = self._run(caller, session, messages, extended, fuzzy, mcp=mcp)
+        if force_mcp and not extended:
+            reply = "The extra ERPNext tools (MCP) are not enabled on this server."
+            st.sessions.add(session, "assistant", reply)
+            return {"reply": reply, "pending_action": None}
+        if extended and (force_mcp or (st.settings.mcp_router and is_non_sales(text))):
+            # /mcp, or clearly not sales: straight to the MCP tools, no wasted built-in-tools call
+            reply, pending, failed, fuzzy, _ = self._mcp_phase(caller, session, extended, fuzzy, mcp)
         else:
+            tz = st.settings.timezone
+            system = SYSTEM.format(currency=self.currency(caller), user=caller,
+                                   can_create="yes" if caller in st.settings.item_creators else "no",
+                                   now=dt.datetime.now(ZoneInfo(tz)).strftime("%A %Y-%m-%d %H:%M"), tz=tz,
+                                   entities=json.dumps(session.entities) if session.entities else "nothing yet")
+            messages = [{"role": "system", "content": system}, *session.messages]
+            if extended:
+                messages.append({"role": "system", "content": MCP_NOTE})
             # Phase 1: the built-in tools are the main controller.
             reply, pending, failed, fuzzy, exhausted = self._run(caller, session, messages, TOOLS, fuzzy)
             # Phase 2: the request the main controller cannot handle falls back to the MCP servers.
             if extended and not pending and (exhausted or UNABLE.search(reply or "")):
-                messages.append({"role": "assistant", "content": reply})
-                messages.append({"role": "user", "content": MCP_FALLBACK})
-                reply, pending, failed, fuzzy, _ = self._run(caller, session, messages, TOOLS + extended, fuzzy, mcp=mcp)
+                reply, pending, failed, fuzzy, _ = self._mcp_phase(caller, session, extended, fuzzy, mcp)
         if not pending and ASKS_CONFIRM.search(reply):
             # The model must never ask for a "yes" when nothing is actually waiting for confirmation.
             reply = (f"I could not set that up: {failed[-1].split(': ', 1)[-1]}. Nothing was changed." if failed else
@@ -224,16 +232,31 @@ class Orchestrator:
         return {"reply": reply, "pending_action": (
             {"id": pending.id, "kind": pending.kind, "preview": pending.payload} if pending else None)}
 
+    def _mcp_phase(self, caller, session, extended, fuzzy, mcp) -> tuple:
+        """Fresh short context (no sales prompt, no refusal from phase 1) with only the MCP tools and two lookups."""
+        tz = self.st.settings.timezone
+        system = MCP_SYSTEM.format(user=caller, now=dt.datetime.now(ZoneInfo(tz)).strftime("%A %Y-%m-%d %H:%M"), tz=tz)
+        messages = [{"role": "system", "content": system}, *session.messages]
+        return self._run(caller, session, messages, extended + MCP_LOOKUPS, fuzzy, mcp=mcp, phase="mcp")
+
+    def _chat(self, caller, messages, tools, phase: str, step: int) -> dict:
+        msg = self.llm.chat(messages, tools)
+        usage = getattr(self.llm, "last_usage", None)
+        if usage:  # token counts per AI call: shows what a request really costs against the provider's per-minute cap
+            self.st.audit.write(caller, "llm", phase=phase, step=step, prompt_tokens=usage.get("prompt_tokens"),
+                                completion_tokens=usage.get("completion_tokens"))
+        return msg
+
     # -- one tool-looping phase ---------------------------------------------------------------
-    def _run(self, caller, session, messages, tools, fuzzy: set, mcp=None) -> tuple:
+    def _run(self, caller, session, messages, tools, fuzzy: set, mcp=None, phase: str = "sales") -> tuple:
         """Loop the LLM over `tools` until it answers without tool calls. Returns
         (reply, pending_action, failed_proposals, fuzzy_set, steps_exhausted)."""
         st = self.st
         pending, failed, nudged, exhausted = None, [], False, False
-        for _ in range(MAX_STEPS):
-            msg = self.llm.chat(messages, tools)
+        for step in range(1, MAX_STEPS + 1):
+            msg = self._chat(caller, messages, tools, phase, step)
             if not msg.get("tool_calls") and not (msg.get("content") or "").strip():
-                msg = self.llm.chat(messages, tools)  # models occasionally return nothing; retry once
+                msg = self._chat(caller, messages, tools, phase, step)  # models occasionally return nothing; retry once
             calls = msg.get("tool_calls") or []
             if not calls:
                 reply = (msg.get("content") or "").strip() or "Sorry, I did not understand that."
@@ -270,7 +293,10 @@ class Orchestrator:
                 if out.get("error") and (name.startswith("propose_") or name.startswith("mcp__")):
                     failed.append(out["error"])
                 self._remember(session, name, out)
-                body = json.dumps(out.get("data", out), default=str)[:MAX_TOOL_RESULT_CHARS]
+                if name.startswith("mcp__"):  # compact and shorter: tool results are resent on every later AI call
+                    body = json.dumps(out.get("data", out), default=str, separators=(",", ":"))[:MAX_MCP_RESULT_CHARS]
+                else:
+                    body = json.dumps(out.get("data", out), default=str)[:MAX_TOOL_RESULT_CHARS]
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": body})
         else:
             exhausted = True

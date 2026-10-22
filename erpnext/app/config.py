@@ -59,6 +59,7 @@ class Settings:
     # MCP fallback servers (name -> command); empty = the built-in tools are the only capability
     mcp_servers: dict[str, str] = field(default_factory=dict)
     mcp_timeout: float = 60.0
+    mcp_router: bool = True  # obvious non-sales requests skip the built-in tools and go straight to MCP
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -91,4 +92,5 @@ class Settings:
             llm_effort=env("LLM_EFFORT", "medium"),
             mcp_servers=parse_mcp_servers(env("MCP_SERVERS", "")),
             mcp_timeout=float(env("MCP_TIMEOUT", "60")),
+            mcp_router=env("MCP_ROUTER", "1").strip().lower() not in ("0", "false", "no", ""),
         )

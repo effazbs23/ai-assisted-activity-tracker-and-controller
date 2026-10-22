@@ -190,3 +190,10 @@ def test_force_mcp_flag_is_sent_only_for_mcp(monkeypatch):
     bot.ask("42", "hi")
     bot.ask("42", "hi", force_mcp=True)
     assert "force_mcp" not in seen[0] and seen[1]["force_mcp"] is True
+
+
+def test_busy_reply_uses_the_retry_after_the_api_sends(monkeypatch):
+    class R:
+        ok, status_code, text, headers = False, 503, "busy", {"Retry-After": "41"}
+    monkeypatch.setattr(telegram_bot.requests, "post", lambda *a, **k: R())
+    assert "about 41 seconds" in Bot(cfg(), StubTelegram(), None, "http://x").ask("42", "hi")

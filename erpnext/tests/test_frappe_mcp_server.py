@@ -90,3 +90,18 @@ def test_real_process_lists_tools():
     out = [json.loads(l) for l in p.stdout.splitlines()]
     assert out[0]["result"]["serverInfo"]["name"] == "frappe"
     assert len(out[1]["result"]["tools"]) == len(TOOLS)
+
+
+def test_a_guessed_field_error_lists_the_real_fields():
+    s, stubs = make()
+    stubs["alice"].db["DocType"] = [{"name": "Customer", "fields": [{"fieldname": "customer_name", "fieldtype": "Data"},
+                                                                    {"fieldname": "sb", "fieldtype": "Section Break"}]}]
+    orig = stubs["alice"].get_list
+    def strict(doctype, filters=None, fields=None, limit=10, order_by=None, or_filters=None):
+        if fields and "amount" in fields:
+            from app.erp.client import ERPError
+            raise ERPError("Field not permitted in query: amount")
+        return orig(doctype, filters, fields, limit, order_by, or_filters)
+    stubs["alice"].get_list = strict
+    err, text = call(s, "list_docs", {"doctype": "Customer", "fields": ["name", "amount"]})
+    assert err and "Valid fields of Customer: customer_name" in text and "sb" not in text
