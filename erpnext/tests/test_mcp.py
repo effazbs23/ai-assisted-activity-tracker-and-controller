@@ -247,3 +247,15 @@ def test_force_mcp_without_mcp_configured_says_so_without_calling_the_llm(tmp_pa
     with TestClient(create_app(settings, by_caller(alice=StubERPNext()), llm)) as client:
         r = client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "x", "session_id": "s", "force_mcp": True})
     assert "not enabled" in r.json()["reply"] and llm.offered == []
+
+
+def test_a_failed_turn_leaves_no_stale_message_in_the_session(app_ctx):
+    client, llm, log, _ = app_ctx
+    class Down:
+        def chat(self, messages, tools): raise RuntimeError("LLM unavailable: 429")
+    real, client.app.state.agent.llm = client.app.state.agent.llm, Down()
+    assert client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "list all users", "session_id": "s"}).status_code == 503
+    client.app.state.agent.llm = real
+    llm.queue = [reply("Hello.")]
+    prompt(client, "show the stock balance report")
+    assert not any("list all users" in str(m.get("content")) for m in llm.seen[0])

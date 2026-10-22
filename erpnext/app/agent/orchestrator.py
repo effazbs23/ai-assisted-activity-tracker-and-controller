@@ -160,6 +160,15 @@ class Orchestrator:
 
     # -- main entry ---------------------------------------------------------------------------
     def handle(self, caller: str, session_id: str, text: str, force_mcp: bool = False) -> dict:
+        try:
+            return self._handle(caller, session_id, text, force_mcp)
+        except Exception:  # e.g. the LLM is down: drop the unanswered message so a later prompt never answers it by mistake
+            msgs = self.st.sessions.get(caller, session_id).messages
+            if msgs and msgs[-1] == {"role": "user", "content": text[:2000]}:
+                msgs.pop()
+            raise
+
+    def _handle(self, caller: str, session_id: str, text: str, force_mcp: bool) -> dict:
         st = self.st
         session = st.sessions.get(caller, session_id)
         st.audit.write(caller, "prompt", session=session_id, chars=len(text))

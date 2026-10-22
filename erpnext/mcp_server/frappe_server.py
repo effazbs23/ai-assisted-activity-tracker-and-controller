@@ -34,7 +34,7 @@ def _tool(name, description, props, required, read_only, destructive=False):
 
 _DT = {"doctype": {**_STR, "description": "ERPNext DocType, e.g. Warehouse, Bin, Employee, Project"}}
 TOOLS = [
-    _tool("list_docs", "List records of a DocType. filters: [[field, op, value], ...] or {field: value}.",
+    _tool("list_docs", "List records of a DocType (default field: name). filters: [[field, op, value], ...] or {field: value}. Use only real field names; call describe_doctype if unsure.",
           {**_DT, "filters": {}, "fields": {"type": "array", "items": _STR}, "limit": {"type": "integer"}, "order_by": _STR},
           ["doctype"], True),
     _tool("get_doc", "Read one full record.", {**_DT, "name": _STR}, ["doctype", "name"], True),
@@ -85,7 +85,7 @@ class Server:
         if name == "get_doc":
             return erp.get_doc(dt, a["name"])
         if name == "describe_doctype":
-            meta = erp.get_doc("DocType", dt)
+            meta = erp.doctype_meta(dt)
             keep = ("fieldname", "label", "fieldtype", "reqd", "options")
             return {"name": dt, "is_submittable": meta.get("is_submittable"),
                     "fields": [{k: f.get(k) for k in keep if f.get(k)} for f in meta.get("fields", [])

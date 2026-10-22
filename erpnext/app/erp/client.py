@@ -27,6 +27,7 @@ class ERPAPI(Protocol):
     def update(self, doctype: str, name: str, values: dict[str, Any]) -> dict[str, Any]: ...
     def submit(self, doctype: str, name: str) -> dict[str, Any]: ...
     def delete(self, doctype: str, name: str) -> None: ...
+    def doctype_meta(self, doctype: str) -> dict[str, Any]: ...
     def call(self, method: str, **kwargs) -> Any: ...
 
 
@@ -105,6 +106,10 @@ class ERPClient:
     def submit(self, doctype, name):
         doc = self.get_doc(doctype, name)
         return self._request("POST", "/api/method/frappe.client.submit", json={"doc": doc})["message"]
+
+    def doctype_meta(self, doctype):
+        """Field list of a DocType. The DocType record itself needs System Manager; this endpoint only needs read access."""
+        return self._request("GET", "/api/method/frappe.desk.form.load.getdoctype", params={"doctype": doctype})["docs"][0]
 
     def call(self, method, **kwargs):
         return self._request("POST", f"/api/method/{method}", json=kwargs)["message"]

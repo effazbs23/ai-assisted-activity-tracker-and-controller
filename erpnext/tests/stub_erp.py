@@ -177,6 +177,10 @@ class StubERPNext:
                 return copy.deepcopy(r)
         raise ERPError("ERPNext record or method not found")
 
+    def doctype_meta(self, doctype):
+        self._guard("DocType")
+        return self.get_doc("DocType", doctype)
+
     def call(self, method, **kwargs):
         self.calls.append((method, kwargs))
         if method.endswith("quotation.make_sales_order"):
