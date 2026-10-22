@@ -42,7 +42,7 @@ class BotConfig:
                 raise RuntimeError(f"Missing required environment variable: {name}")
             return os.environ[name].strip()
         return cls(need("TELEGRAM_BOT_TOKEN"), os.environ.get("STT_API_KEY", "").strip(),
-                   _pairs(need("TELEGRAM_USERS")), _pairs(need("MIDDLEWARE_KEYS")),
+                   _pairs(os.environ.get("TELEGRAM_USERS", "")), _pairs(need("MIDDLEWARE_KEYS")),
                    os.environ.get("STT_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/"),
                    os.environ.get("STT_MODEL", "whisper-large-v3"), os.environ.get("STT_LANGUAGE", "en").strip())
 
