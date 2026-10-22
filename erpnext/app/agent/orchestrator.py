@@ -66,6 +66,11 @@ MCP_NOTE = ("Extra capability: requests outside the built-in tools can fall back
             "and honestly instead of inventing an answer. The 'frappe' server reaches any other ERPNext doctype (stock, HR, "
             "accounting, projects, reports) as the current user: call mcp__frappe__describe_doctype before create_doc.")
 
+MCP_FORCED = ("[system] The user explicitly asked to use the MCP tools (names start with mcp__) for this request. Only those "
+              "tools are available now. Read-only MCP tools run immediately; any other MCP tool only PROPOSES the call and "
+              "the user must reply yes before it runs, so for a create/update/submit/cancel request call the tool right away. "
+              "Call the right tool now, or ask one short clarifying question only if a required detail is missing.")
+
 MCP_FALLBACK = ("[system] The built-in tools cannot handle this request. Extended MCP tools are now available (names start "
                 "with mcp__). Use them to help the user. Read-only MCP tools run immediately; any other MCP tool only "
                 "PROPOSES the call and the user must reply yes before it runs, so for a create/update/submit/cancel request call the "
@@ -154,7 +159,7 @@ class Orchestrator:
         return "Done."
 
     # -- main entry ---------------------------------------------------------------------------
-    def handle(self, caller: str, session_id: str, text: str) -> dict:
+    def handle(self, caller: str, session_id: str, text: str, force_mcp: bool = False) -> dict:
         st = self.st
         session = st.sessions.get(caller, session_id)
         st.audit.write(caller, "prompt", session=session_id, chars=len(text))
@@ -178,13 +183,21 @@ class Orchestrator:
         if extended:
             messages.append({"role": "system", "content": MCP_NOTE.format(servers=", ".join(mcp.names))})
         fuzzy: set = set()  # records only *suggested* this turn; unusable for writes until the user answers
-        # Phase 1: the built-in tools are the main controller.
-        reply, pending, failed, fuzzy, exhausted = self._run(caller, session, messages, TOOLS, fuzzy)
-        # Phase 2: the request the main controller cannot handle falls back to the MCP servers.
-        if extended and not pending and (exhausted or UNABLE.search(reply or "")):
-            messages.append({"role": "assistant", "content": reply})
-            messages.append({"role": "user", "content": MCP_FALLBACK})
-            reply, pending, failed, fuzzy, _ = self._run(caller, session, messages, TOOLS + extended, fuzzy, mcp=mcp)
+        if force_mcp:  # /mcp: no phase 1, only the MCP tools
+            if not extended:
+                reply = "The extra ERPNext tools (MCP) are not enabled on this server."
+                st.sessions.add(session, "assistant", reply)
+                return {"reply": reply, "pending_action": None}
+            messages.append({"role": "user", "content": MCP_FORCED})
+            reply, pending, failed, fuzzy, _ = self._run(caller, session, messages, extended, fuzzy, mcp=mcp)
+        else:
+            # Phase 1: the built-in tools are the main controller.
+            reply, pending, failed, fuzzy, exhausted = self._run(caller, session, messages, TOOLS, fuzzy)
+            # Phase 2: the request the main controller cannot handle falls back to the MCP servers.
+            if extended and not pending and (exhausted or UNABLE.search(reply or "")):
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content": MCP_FALLBACK})
+                reply, pending, failed, fuzzy, _ = self._run(caller, session, messages, TOOLS + extended, fuzzy, mcp=mcp)
         if not pending and ASKS_CONFIRM.search(reply):
             # The model must never ask for a "yes" when nothing is actually waiting for confirmation.
             reply = (f"I could not set that up: {failed[-1].split(': ', 1)[-1]}. Nothing was changed." if failed else

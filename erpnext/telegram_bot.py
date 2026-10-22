@@ -66,6 +66,9 @@ class TelegramClient:
     def delete_webhook(self):
         return self.call("deleteWebhook", drop_pending_updates=False)
 
+    def set_commands(self):
+        return self.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in COMMANDS])
+
     def updates(self, offset: int | None):
         params = {"timeout": 25, "allowed_updates": ["message"]}
         if offset is not None:
@@ -123,6 +126,33 @@ def plain(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+COMMANDS = [("help", "What I can do"), ("mcp", "Use the extra ERPNext tools: /mcp <request>"), ("id", "Show your Telegram id")]
+HELP_TEXT = """What I can do
+
+SALES (built in)
+\u2022 Find customers, leads, items and prices
+\u2022 Show or create opportunities, quotations and sales orders
+\u2022 Log your daily activity: "Met XYZ, sent quote, awaiting BOQ"
+\u2022 Summaries: "Summarise my sales this month"
+
+ANYTHING ELSE IN ERPNEXT (extra tools)
+\u2022 List and count records: "List all warehouses", "How many projects do we have?"
+\u2022 Run reports and view users (read only)
+\u2022 Create or update records: "Create a note titled Call back with the content Nizwa"
+
+I ALWAYS ASK FIRST
+Every change shows a preview and waits for your yes. I never delete anything or change security settings.
+
+COMMANDS
+/help - this list
+/mcp <request> - force the extra ERPNext tools, e.g. /mcp list all warehouses
+/id - your Telegram id
+
+Your ERPNext role decides what is allowed, and some actions are limited to certain users."""
+HELP = re.compile(r"^\s*(/(help|start)(@\w+)?|help|what can you (do|help with)\??|what (are )?(your )?(commands|features|capabilities)\??)\s*$", re.I)
+MCP_CMD = re.compile(r"^/mcp(@\w+)?(\s+(.*))?$", re.I | re.S)
+
+
 class Bot:
     def __init__(self, config: BotConfig, telegram: TelegramClient, stt: Transcriber, url: str, api_key: str = ""):
         self.config, self.telegram, self.stt = config, telegram, stt
@@ -158,10 +188,11 @@ class Bot:
             return self.stt.transcribe(*upload_args(path, content), vocabulary=self.vocabulary())
         return ""
 
-    def ask(self, user_id: str, text: str) -> str:
+    def ask(self, user_id: str, text: str, force_mcp: bool = False) -> str:
         caller = getattr(self.config, "users", {}).get(user_id)
         key = self.config.keys.get(caller, self.api_key) if caller else self.api_key
-        r = requests.post(f"{self.url}/v1/prompt", json={"message": text, "session_id": user_id},
+        body = {"message": text, "session_id": user_id, **({"force_mcp": True} if force_mcp else {})}
+        r = requests.post(f"{self.url}/v1/prompt", json=body,
                           headers={"X-API-Key": key}, timeout=120)
         if r.status_code == 429:
             return "You are sending messages too quickly. Please wait a minute."
@@ -187,7 +218,14 @@ class Bot:
                 return
             if message.get("voice") or message.get("audio"):
                 self.telegram.send(chat_id, f"Heard: {text}")
-            self.telegram.send(chat_id, plain(self.ask(user_id, text)))
+            if HELP.match(text):
+                self.telegram.send(chat_id, HELP_TEXT)
+            elif m := MCP_CMD.match(text):
+                request = (m.group(3) or "").strip()
+                self.telegram.send(chat_id, plain(self.ask(user_id, request, force_mcp=True)) if request
+                                   else "Usage: /mcp <request>, for example /mcp list all warehouses")
+            else:
+                self.telegram.send(chat_id, plain(self.ask(user_id, text)))
         except ValueError:
             self.telegram.send(chat_id, f"That voice note is too long. Please keep it under {MAX_VOICE_SECONDS // 60} minutes.")
         except Exception:
@@ -204,6 +242,10 @@ def main():
     config = BotConfig.from_env()
     bot = Bot(config, TelegramClient(config), Transcriber(config), os.environ.get("MIDDLEWARE_URL", "http://127.0.0.1:8100"))
     bot.telegram.delete_webhook()
+    try:
+        bot.telegram.set_commands()  # the "/" menu in Telegram
+    except Exception:
+        LOG.warning("Could not register the bot commands", exc_info=True)
     LOG.info("Telegram bot started. Allowed users: %s", config.users)
     offset = None
     while True:

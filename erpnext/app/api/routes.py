@@ -265,12 +265,13 @@ def cancel_action(action_id: str, request: Request, caller: str = Caller):
 class PromptRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
     session_id: str = Field(default="default", min_length=1, max_length=100)
+    force_mcp: bool = False  # skip the built-in tools and use only the MCP tools (Telegram /mcp)
 
 
 @router.post("/prompt")
 def prompt(body: PromptRequest, request: Request, caller: str = Caller):
     try:
-        out = request.app.state.agent.handle(caller, body.session_id, body.message)
+        out = request.app.state.agent.handle(caller, body.session_id, body.message, body.force_mcp)
     except (RuntimeError, requests.RequestException) as exc:
         raise HTTPException(503, f"AI service unavailable: {exc}")
     return {"session_id": body.session_id, **out}

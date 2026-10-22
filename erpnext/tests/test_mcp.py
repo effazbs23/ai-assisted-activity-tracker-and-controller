@@ -230,3 +230,20 @@ def test_pending_mcp_write_is_bullets_not_json(app_ctx):
                  reply('{"status": "awaiting_user_confirmation"}')]
     text = prompt(client, "note it")["reply"]
     assert "{" not in text and "• text: call back" in text and "• title: T" in text and "yes" in text
+
+
+def test_force_mcp_skips_phase_1_and_offers_only_mcp_tools(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [tool_call("mcp__fake__get_weather", {"city": "Muscat"}), reply("Sunny.")]
+    r = client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "weather", "session_id": "s", "force_mcp": True})
+    assert r.json()["reply"] == "Sunny."
+    assert all(n.startswith("mcp__") for n in llm.offered[0]) and llm.offered[0]  # no built-in tool was offered
+    assert [c["name"] for c in calls(log)] == ["get_weather"]
+
+
+def test_force_mcp_without_mcp_configured_says_so_without_calling_the_llm(tmp_path):
+    llm = RecordingLLM()
+    settings = Settings(api_keys={"k1": "alice"}, audit_log_path=str(tmp_path / "a.log"), rate_limit_per_minute=1000)
+    with TestClient(create_app(settings, by_caller(alice=StubERPNext()), llm)) as client:
+        r = client.post("/v1/prompt", headers={"X-API-Key": "k1"}, json={"message": "x", "session_id": "s", "force_mcp": True})
+    assert "not enabled" in r.json()["reply"] and llm.offered == []

@@ -149,3 +149,44 @@ def test_voice_language_defaults_to_english(monkeypatch):
     assert BotConfig("t", "k", {}, {}).stt_language == "en"
     monkeypatch.setenv("STT_LANGUAGE", "ar")
     assert BotConfig.from_env().stt_language == "ar"
+
+
+def test_help_start_and_plain_questions_get_the_fixed_help_without_the_middleware():
+    tg = StubTelegram()
+    bot = Bot(cfg(), tg, None, "http://x")
+    bot.ask = lambda *a, **k: (_ for _ in ()).throw(AssertionError("help must not call the middleware"))
+    for text in ("/help", "/start", "/help@my_bot", "help", "What can you do?"):
+        bot.handle(msg(42, text))
+    assert tg.sent == [telegram_bot.HELP_TEXT] * 5
+    assert "/mcp" in telegram_bot.HELP_TEXT and "SALES" in telegram_bot.HELP_TEXT
+
+
+def test_help_is_not_shown_to_unauthorised_users():
+    tg = StubTelegram()
+    Bot(cfg(), tg, None, "http://x").handle(msg(7, "/help"))
+    assert "not authorised" in tg.sent[0]
+
+
+def test_mcp_command_forces_mcp_and_needs_a_request():
+    tg, seen = StubTelegram(), []
+    bot = Bot(cfg(), tg, None, "http://x")
+    bot.ask = lambda uid, text, force_mcp=False: seen.append((uid, text, force_mcp)) or "ok"
+    bot.handle(msg(42, "/mcp list all warehouses"))
+    bot.handle(msg(42, "/mcp@my_bot  count projects "))
+    bot.handle(msg(42, "/mcp"))
+    bot.handle(msg(42, "plain message"))
+    assert seen == [("42", "list all warehouses", True), ("42", "count projects", True), ("42", "plain message", False)]
+    assert tg.sent[2].startswith("Usage: /mcp")
+
+
+def test_force_mcp_flag_is_sent_only_for_mcp(monkeypatch):
+    seen = []
+
+    class R:
+        ok, status_code = True, 200
+        def json(self): return {"reply": "ok"}
+    monkeypatch.setattr(telegram_bot.requests, "post", lambda url, json=None, headers=None, timeout=None: seen.append(json) or R())
+    bot = Bot(cfg(), StubTelegram(), None, "http://mw")
+    bot.ask("42", "hi")
+    bot.ask("42", "hi", force_mcp=True)
+    assert "force_mcp" not in seen[0] and seen[1]["force_mcp"] is True
