@@ -53,9 +53,16 @@ def test_limit_capped_and_count():
 
 def test_security_doctypes_denied():
     s, _ = make()
-    for name, args in (("list_docs", {"doctype": "User"}), ("create_doc", {"doctype": "DocPerm", "data": {}})):
+    for name, args in (("list_docs", {"doctype": "Role"}), ("create_doc", {"doctype": "DocPerm", "data": {}}),
+                       ("create_doc", {"doctype": "User", "data": {}}), ("update_doc", {"doctype": "User", "name": "x", "data": {}})):
         err, text = call(s, name, args)
         assert err and "not available" in text
+
+
+def test_users_are_readable_but_not_writable():
+    s, stubs = make()
+    stubs["alice"].db["User"] = [{"name": "alice@example.com", "full_name": "Alice"}]
+    assert json.loads(call(s, "list_docs", {"doctype": "User", "fields": ["name", "full_name"]})[1])[0]["full_name"] == "Alice"
 
 
 def test_privileged_actions_gated():

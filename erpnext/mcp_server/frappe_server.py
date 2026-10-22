@@ -13,10 +13,12 @@ import sys
 from app.config import Settings
 from app.erp.client import ERPError, client_factory
 
-# Security-critical DocTypes: never readable or writable through this server.
+# Security-critical DocTypes: never writable through this server, and not readable either, except READABLE.
 DENIED = {"User", "Role", "Has Role", "DocPerm", "Custom DocPerm", "User Permission", "API Key", "OAuth Client",
           "OAuth Bearer Token", "OAuth Authorization Code", "Token Cache", "Social Login Key", "System Settings",
           "Email Account", "Session Default Settings", "Access Log", "Activity Log", "Error Log"}
+
+READABLE = {"User"}  # read-only; ERPNext still applies the caller's own permissions. Passwords/secrets are masked by Frappe.
 
 _STR = {"type": "string"}
 _OBJ = {"type": "object"}
@@ -59,7 +61,7 @@ class Server:
         s = self.settings
         if not isinstance(doctype, str) or not doctype or "/" in doctype:
             raise ValueError("doctype is required")
-        if doctype in DENIED:
+        if doctype in DENIED and not (op == "read" and doctype in READABLE):
             raise PermissionError(f"{doctype} is not available through this assistant")
         if doctype == "Sales Order" and op in ("submit", "cancel") and caller not in s.confirm_callers:
             raise PermissionError("Only authorised callers can submit or cancel Sales Orders")
@@ -73,7 +75,7 @@ class Server:
         dt = a.get("doctype")
         if name == "run_report":
             return erp.call("frappe.desk.query_report.run", report_name=a["report_name"], filters=a.get("filters") or {})
-        op = {"create_doc": "create", "submit_doc": "submit", "cancel_doc": "cancel"}.get(name, "read")
+        op = {"create_doc": "create", "update_doc": "update", "submit_doc": "submit", "cancel_doc": "cancel"}.get(name, "read")
         self._check(caller, dt, op)
         if name == "list_docs":
             limit = max(1, min(int(a.get("limit") or 20), self.settings.max_page_size))
