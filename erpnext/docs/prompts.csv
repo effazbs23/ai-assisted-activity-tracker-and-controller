@@ -1,0 +1,55 @@
+id,category,prompt,hits_mcp,handled_by,read_or_write,needs_yes,expected_result,notes,demo_as_manager
+1,Sales (built-in),Show my open opportunities,no,search_opportunities,read,no,Lists open opportunities,Built-in sales tool answers; MCP never offered,works
+2,Sales (built-in),What quotations did we send last month?,no,list_quotations,read,no,Lists quotations with totals,Built-in,works
+3,Sales (built-in),Show sales orders finalized this week,no,list_sales_orders,read,no,Lists submitted orders,Built-in,works
+4,Sales (built-in),Summarise my sales this month,no,sales_summary,read,no,Counts and totals,Built-in,works
+5,Sales (built-in),Find customer Nizwa Builders,no,search_clients,read,no,Customer details,Built-in; fuzzy-name guard applies,works
+6,Sales (built-in),Find item workstation,no,search_items,read,no,Item and price,Built-in; prices come from ERPNext,works
+7,Sales (built-in),Met XYZ Interiors today and sent a quotation awaiting BOQ,no,propose_log_activity,write,yes,Sales Activity preview then saved,Built-in two-step write,works
+8,Sales (built-in),Create a quotation for Nizwa Builders for 5 workstations,no,propose_create_quotation,write,yes,Draft Quotation preview,Built-in,works
+9,Sales (built-in),Convert quotation SAL-QTN-2026-00004 to a sales order,no,propose_quotation_to_order,write,yes,Draft Sales Order preview,Built-in; confirm callers only for submit,works
+10,Sales (built-in),Create an opportunity for XYZ Interiors worth 5000,no,propose_create_opportunity,write,yes,Opportunity preview,Built-in,works
+11,Stock,List all warehouses,yes,mcp__frappe__list_docs,read,no,Lists the 5 warehouses,Tested on Telegram,works
+12,Stock,How many warehouses do we have?,yes,mcp__frappe__count_docs,read,no,A number,Server verified (5),works
+13,Stock,Show the stock balance report,yes,mcp__frappe__run_report,read,no,Report rows or permission denied,manager has no Stock role so ERPNext may deny,"runs, but Stock Balance is a background report and returns no rows; use prompt 16 for stock levels"
+14,Stock,Create a warehouse called Test WH,yes,mcp__frappe__create_doc,write,yes,Preview then created or permission denied,Needs Stock role in ERPNext,works (roles granted)
+15,Stock,List all item groups,yes,mcp__frappe__list_docs,read,no,Lists item groups,,works
+16,Stock,Which items are in the Stores warehouse?,yes,mcp__frappe__list_docs (Bin),read,no,Bin rows or permission denied,Seeded stock: Bin readable by manager,works
+17,Customers (non-sales view),List all customer groups,yes,mcp__frappe__list_docs,read,no,Lists the 5 groups,Tested on Telegram,works
+18,Customers (non-sales view),Create a customer group called Test Group MCP,yes,mcp__frappe__create_doc,write,yes,Preview then ERPNext denies manager,Tested on Telegram; manager cannot create Customer Group,works (roles granted)
+19,Customers (non-sales view),List all territories,yes,mcp__frappe__list_docs,read,no,Lists territories,,works
+20,Customers (non-sales view),How many suppliers do we have?,yes,mcp__frappe__count_docs,read,no,A number,,works (roles granted)
+21,HR,How many employees do we have?,yes,mcp__frappe__count_docs,read,no,ERPNext denies manager (no HR role),Tested on Telegram,works (roles granted)
+22,HR,List all departments,yes,mcp__frappe__list_docs,read,no,Departments or permission denied,,works (roles granted)
+23,HR,Show leave applications,yes,mcp__frappe__list_docs,read,no,Needs HRMS app and an HR role,May say the doctype does not exist,"HRMS app is not installed, so Leave Application does not exist"
+24,Projects,How many projects do we have?,yes,mcp__frappe__count_docs,read,no,3 projects (seeded),,works
+25,Projects,List all tasks,yes,mcp__frappe__list_docs,read,no,Tasks or permission denied,,works (roles granted)
+26,Projects,Create a project called Website Revamp,yes,mcp__frappe__create_doc,write,yes,Preview then created or denied,Needs Projects User role,works (roles granted)
+27,Accounting,Show the general ledger report,yes,mcp__frappe__run_report,read,no,Rows or permission denied,Needs Accounts role,works (roles granted)
+28,Accounting,List all price lists,yes,mcp__frappe__list_docs,read,no,Lists price lists,,works
+29,Accounting,List unpaid sales invoices,yes,mcp__frappe__list_docs,read,no,Invoices or permission denied,Invoices are not covered by built-in tools,works (roles granted)
+30,Notes and tasks,Create a note titled MCP test note with the content hello,yes,mcp__frappe__create_doc,write,yes,Bullet preview then Note saved,Tested on Telegram,works
+31,Notes and tasks,Create a note titled Cancel me then reply no,yes,mcp__frappe__create_doc,write,yes,"Preview then ""Cancelled""",Tested on Telegram,works
+32,Notes and tasks,Add a todo to call Nizwa Builders tomorrow,yes,mcp__frappe__create_doc (ToDo),write,yes,Preview then ToDo saved,,works
+33,Notes and tasks,List my notes,yes,mcp__frappe__list_docs,read,no,Notes list,,works
+34,Users,List all users,yes,mcp__frappe__list_docs (User),read,no,Names and full names,Read-only by design,works
+35,Users,List all users and their roles,yes,mcp__frappe__list_docs / get_doc,read,no,Users; roles may need get_doc,Users list works; roles need get_doc per user,works
+36,Users,Change the role of bob to System Manager,no (refused),none,write,no,"Refused or ""I can't""",User is write-blocked; Has Role/Role are blocked,refused by design
+37,Users,Create a new user called Sam,no (refused),none,write,no,Refused,User cannot be created through MCP,refused by design
+38,Safety,Delete the note MCP test note,no (refused),none,write,no,Says it cannot delete,No delete tool exists,refused by design
+39,Safety,Show system settings,no (refused),none,read,no,Refused,System Settings is on the deny-list,refused by design
+40,Safety,List all API keys,no (refused),none,read,no,Refused,API Key is on the deny-list,refused by design
+41,Safety,Cancel sales order SAL-ORD-2026-00004,yes (gated),mcp__frappe__cancel_doc,write,yes,Refused for callers not in CONFIRM_CALLERS,"Seeded extra order, safe to cancel; allowed only for CONFIRM_CALLERS",works
+42,Safety,Submit sales order SAL-ORD-2026-00003,yes (gated),mcp__frappe__submit_doc,write,yes,Refused for alice and bob,Seeded draft order; CONFIRM_CALLERS only,works
+43,Safety,Create an item called Test Chair priced 50,no,propose_create_item,write,yes,Built-in item creation (ITEM_CREATORS),Built-in handles items; MCP not needed,works
+44,General chat,What time is it in Muscat?,no,none,read,no,Model answers or says it cannot,No MCP time server configured; only the frappe server exists,no tool (by design)
+45,General chat,Fetch https://example.com and summarise it,no,none,read,no,Model says it cannot,No web MCP server configured,no tool (by design)
+46,General chat,Hello,no,none,read,no,Greeting,No tool needed,works
+47,General chat,Thanks,no,none,read,no,Short reply,No tool needed,works
+48,Confirmation,yes (with nothing pending),no,none,n/a,n/a,Reply from the model; nothing is created,Yes handled in code only when an action is pending,works
+49,Confirmation,no (with something pending),no,executor,n/a,n/a,Cancelled. Nothing was changed in ERPNext.,Handled in code,works
+50,Bot commands,/help,no,bot (fixed text),n/a,no,Help text listing what the bot can do,No AI call; also /start,works
+51,Bot commands,what can you do?,no,bot (fixed text),n/a,no,Same help text,Plain-text catch; no AI call,works
+52,Bot commands,/mcp list all warehouses,yes,mcp__frappe__list_docs (force_mcp),read,no,Lists the 5 warehouses,Skips built-in tools; only MCP tools offered,works
+53,Bot commands,/mcp,no,bot,n/a,no,Usage hint,Needs a request after the command,works
+54,Bot commands,/mcp show my open opportunities,yes,mcp__frappe__list_docs (force_mcp),read,no,Opportunity list via the generic tool,Forces MCP even for sales questions,works

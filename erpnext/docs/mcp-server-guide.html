@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the ERPNext MCP Server Works</title>
+<style>
+  :root {
+    --bg: #f6f7fb; --card: #ffffff; --ink: #1c2333; --muted: #5b657a; --line: #d9deea;
+    --brand: #4f46e5; --brand-soft: #e9e8ff; --read: #0f9d6b; --read-soft: #dff5ec;
+    --write: #d97706; --write-soft: #fdf0dc; --stop: #dc2626; --stop-soft: #fde4e4;
+    --erp: #0ea5e9; --erp-soft: #def3fd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1420; --card: #171e2e; --ink: #e8ecf5; --muted: #9aa5bd; --line: #2a3349;
+      --brand: #8b85ff; --brand-soft: #25234d; --read: #34d399; --read-soft: #123a2d;
+      --write: #fbbf24; --write-soft: #3d2f10; --stop: #f87171; --stop-soft: #3f1a1a;
+      --erp: #38bdf8; --erp-soft: #0f3347;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 2rem; margin: 0 0 6px; line-height: 1.2; }
+  h2 { font-size: 1.35rem; margin: 44px 0 12px; }
+  h3 { font-size: 1.05rem; margin: 0 0 6px; }
+  p { margin: 8px 0; }
+  .lead { color: var(--muted); font-size: 1.1rem; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; margin: 14px 0; }
+  .fig { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px; margin: 14px 0; }
+  .fig svg { width: 100%; height: auto; display: block; }
+  .fig figcaption { color: var(--muted); font-size: .9rem; padding: 6px 8px 2px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+  .tool { border-radius: 12px; padding: 12px 14px; border: 1px solid var(--line); background: var(--card); }
+  .tool code { font-weight: 700; }
+  .tool.read { border-left: 5px solid var(--read); }
+  .tool.write { border-left: 5px solid var(--write); }
+  .tag { display: inline-block; font-size: .72rem; font-weight: 700; padding: 1px 8px; border-radius: 99px; margin-left: 6px; vertical-align: middle; }
+  .tag.read { background: var(--read-soft); color: var(--read); }
+  .tag.write { background: var(--write-soft); color: var(--write); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88rem; }
+  code { background: var(--brand-soft); padding: 1px 6px; border-radius: 6px; }
+  pre { background: #0f1420; color: #e8ecf5; padding: 14px 16px; border-radius: 12px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .03em; }
+  .chat { max-width: 560px; margin: 10px 0; }
+  .bubble { padding: 8px 12px; border-radius: 14px; margin: 6px 0; width: fit-content; max-width: 92%; }
+  .me { background: var(--brand); color: #fff; margin-left: auto; border-bottom-right-radius: 4px; }
+  .bot { background: var(--brand-soft); border-bottom-left-radius: 4px; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: .8rem; font-weight: 600; }
+  .ok { background: var(--read-soft); color: var(--read); }
+  .no { background: var(--stop-soft); color: var(--stop); }
+  ul { padding-left: 1.2rem; margin: 6px 0; }
+  li { margin: 3px 0; }
+  .t { fill: var(--ink); font: 600 14px system-ui, sans-serif; }
+  .s { fill: var(--muted); font: 12px system-ui, sans-serif; }
+  .box { fill: var(--card); stroke: var(--line); stroke-width: 1.5; }
+  .arrow { stroke: var(--muted); stroke-width: 2; fill: none; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>How the ERPNext MCP Server Works</h1>
+<p class="lead">The assistant already knows the sales side of ERPNext. The MCP server teaches it everything else, as the person who is chatting, and only after they say "yes" to changes.</p>
+
+<h2>1. The idea in one minute</h2>
+<div class="card">
+  <p>A salesperson chats with a Telegram bot. The bot has a small set of <b>built-in tools</b> for sales work: leads, quotations, sales orders and daily activities.</p>
+  <p>Before this server existed, a question like <i>"list all warehouses"</i> got the answer <i>"I don't have a tool for that."</i></p>
+  <p>The <b>MCP server</b> (named <code>frappe</code>) is a second toolbox. It lets the assistant read and change <b>any other ERPNext record</b>: stock, accounting, projects, notes and more. <b>MCP</b> (Model Context Protocol) is just a standard way for an AI app to plug in extra tools.</p>
+</div>
+
+<h2>2. The big picture</h2>
+<figure class="fig">
+<svg viewBox="0 0 900 250" role="img" aria-label="Telegram to bot to API to AI to tools to ERPNext">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+  <rect class="box" x="10" y="85" width="120" height="70" rx="12"/><text class="t" x="70" y="115" text-anchor="middle">Telegram</text><text class="s" x="70" y="135" text-anchor="middle">you type or talk</text>
+  <rect class="box" x="170" y="85" width="120" height="70" rx="12"/><text class="t" x="230" y="115" text-anchor="middle">Bot</text><text class="s" x="230" y="135" text-anchor="middle">knows who you are</text>
+  <rect class="box" x="330" y="85" width="130" height="70" rx="12"/><text class="t" x="395" y="115" text-anchor="middle">API + AI brain</text><text class="s" x="395" y="135" text-anchor="middle">decides what to do</text>
+  <rect x="520" y="15" width="170" height="70" rx="12" fill="var(--brand-soft)" stroke="var(--brand)" stroke-width="1.5"/><text class="t" x="605" y="44" text-anchor="middle">Built-in tools</text><text class="s" x="605" y="64" text-anchor="middle">leads, quotes, orders</text>
+  <rect x="520" y="165" width="170" height="70" rx="12" fill="var(--brand-soft)" stroke="var(--brand)" stroke-width="2.5"/><text class="t" x="605" y="194" text-anchor="middle">MCP server "frappe"</text><text class="s" x="605" y="214" text-anchor="middle">everything else</text>
+  <rect x="740" y="85" width="150" height="70" rx="12" fill="var(--erp-soft)" stroke="var(--erp)" stroke-width="1.5"/><text class="t" x="815" y="115" text-anchor="middle">ERPNext</text><text class="s" x="815" y="135" text-anchor="middle">your real data</text>
+  <path class="arrow" d="M130 120H168" marker-end="url(#a)"/><path class="arrow" d="M290 120H328" marker-end="url(#a)"/>
+  <path class="arrow" d="M460 110L518 62" marker-end="url(#a)"/><path class="arrow" d="M460 130L518 188" marker-end="url(#a)"/>
+  <path class="arrow" d="M690 55L738 105" marker-end="url(#a)"/><path class="arrow" d="M690 195L738 135" marker-end="url(#a)"/>
+</svg>
+<figcaption>The built-in tools are tried first. The MCP server is the fallback for everything they cannot do.</figcaption>
+</figure>
+
+<h2>3. How one request is handled</h2>
+<figure class="fig">
+<svg viewBox="0 0 900 330" role="img" aria-label="Two phase flow">
+  <rect x="20" y="20" width="170" height="60" rx="12" class="box"/><text class="t" x="105" y="48" text-anchor="middle">Your message</text><text class="s" x="105" y="66" text-anchor="middle">"list all warehouses"</text>
+  <rect x="250" y="20" width="200" height="60" rx="12" fill="var(--brand-soft)" stroke="var(--brand)"/><text class="t" x="350" y="48" text-anchor="middle">Phase 1</text><text class="s" x="350" y="66" text-anchor="middle">AI tries the built-in tools</text>
+  <path class="arrow" d="M190 50H248" marker-end="url(#a)"/>
+  <path class="arrow" d="M450 50H588" marker-end="url(#a)"/>
+  <text class="s" x="520" y="42" text-anchor="middle">can do it</text>
+  <rect x="590" y="20" width="200" height="60" rx="12" fill="var(--read-soft)" stroke="var(--read)"/><text class="t" x="690" y="48" text-anchor="middle">Answer or preview</text><text class="s" x="690" y="66" text-anchor="middle">normal sales flow</text>
+  <path class="arrow" d="M350 80V140" marker-end="url(#a)"/>
+  <text class="s" x="362" y="115">"I can't…" or ran out of steps</text>
+  <rect x="250" y="140" width="200" height="60" rx="12" fill="var(--brand-soft)" stroke="var(--brand)" stroke-width="2.5"/><text class="t" x="350" y="168" text-anchor="middle">Phase 2</text><text class="s" x="350" y="186" text-anchor="middle">MCP tools are added</text>
+  <path class="arrow" d="M450 155L588 125" marker-end="url(#a)"/><path class="arrow" d="M450 185L588 225" marker-end="url(#a)"/>
+  <rect x="590" y="95" width="260" height="60" rx="12" fill="var(--read-soft)" stroke="var(--read)"/><text class="t" x="720" y="123" text-anchor="middle">Read tool</text><text class="s" x="720" y="141" text-anchor="middle">runs now, answer comes back</text>
+  <rect x="590" y="195" width="260" height="60" rx="12" fill="var(--write-soft)" stroke="var(--write)"/><text class="t" x="720" y="223" text-anchor="middle">Write tool</text><text class="s" x="720" y="241" text-anchor="middle">waits: "reply yes to confirm"</text>
+  <text class="s" x="20" y="300">If a write is waiting, only a "yes" from you runs it. "No" cancels it. Nothing is changed before that.</text>
+</svg>
+<figcaption>MCP tools are only offered in phase 2, so the safe, checked sales tools always get the first try.</figcaption>
+</figure>
+
+<h2>4. What it can do</h2>
+<p>Nine tools, split into <span class="pill ok">read: runs immediately</span> and <span class="pill" style="background:var(--write-soft);color:var(--write)">write: needs your yes</span>.</p>
+<div class="grid">
+  <div class="tool read"><h3><code>list_docs</code><span class="tag read">READ</span></h3><p>List records of any type. "List all warehouses."</p></div>
+  <div class="tool read"><h3><code>get_doc</code><span class="tag read">READ</span></h3><p>Open one record in full.</p></div>
+  <div class="tool read"><h3><code>count_docs</code><span class="tag read">READ</span></h3><p>Count records. "How many projects do we have?"</p></div>
+  <div class="tool read"><h3><code>describe_doctype</code><span class="tag read">READ</span></h3><p>Learn a record type's fields so the AI fills in new records correctly.</p></div>
+  <div class="tool read"><h3><code>run_report</code><span class="tag read">READ</span></h3><p>Run a saved ERPNext report, for example stock balance.</p></div>
+  <div class="tool write"><h3><code>create_doc</code><span class="tag write">WRITE</span></h3><p>Create a new record. "Create a note titled…"</p></div>
+  <div class="tool write"><h3><code>update_doc</code><span class="tag write">WRITE</span></h3><p>Change fields on an existing record.</p></div>
+  <div class="tool write"><h3><code>submit_doc</code><span class="tag write">WRITE</span></h3><p>Submit a draft so it becomes final.</p></div>
+  <div class="tool write"><h3><code>cancel_doc</code><span class="tag write">WRITE</span></h3><p>Cancel a submitted record.</p></div>
+</div>
+
+<h3 style="margin-top:22px">Requests it fulfils (examples)</h3>
+<div class="card">
+  <table>
+    <tr><th>You say</th><th>What happens</th></tr>
+    <tr><td>"list all warehouses"</td><td>Reads and shows the 5 warehouses straight away.</td></tr>
+    <tr><td>"list all customer groups"</td><td>Reads and shows the groups straight away.</td></tr>
+    <tr><td>"how many projects do we have?"</td><td>Counts them straight away.</td></tr>
+    <tr><td>"list all users"</td><td>Shows the people in the system (read-only).</td></tr>
+    <tr><td>"create a note titled …"</td><td>Shows exactly what it will do, then waits for yes.</td></tr>
+  </table>
+  <p style="color:var(--muted)">Anything that is not sales and that your ERPNext account is allowed to touch is fair game.</p>
+</div>
+
+<h3>What it will never do</h3>
+<div class="card" style="border-left:5px solid var(--stop)">
+  <ul>
+    <li><b>Delete anything.</b> There is no delete tool.</li>
+    <li><b>Change security settings.</b> Roles, permission rules, API keys, system settings and logs are blocked. Users can be viewed but never changed.</li>
+    <li><b>Run a write without your yes.</b></li>
+    <li><b>Work around your permissions.</b> See the next section.</li>
+  </ul>
+</div>
+
+<h2>5. It acts as you, not as an admin</h2>
+<figure class="fig">
+<svg viewBox="0 0 900 260" role="img" aria-label="Each person has their own key">
+  <rect class="box" x="20" y="20" width="150" height="60" rx="12"/><text class="t" x="95" y="48" text-anchor="middle">manager</text><text class="s" x="95" y="66" text-anchor="middle">own ERPNext key</text>
+  <rect class="box" x="20" y="100" width="150" height="60" rx="12"/><text class="t" x="95" y="128" text-anchor="middle">alice</text><text class="s" x="95" y="146" text-anchor="middle">own ERPNext key</text>
+  <rect class="box" x="20" y="180" width="150" height="60" rx="12"/><text class="t" x="95" y="208" text-anchor="middle">bob</text><text class="s" x="95" y="226" text-anchor="middle">own ERPNext key</text>
+  <path class="arrow" d="M170 50L328 110" marker-end="url(#a)"/><path class="arrow" d="M170 130H328" marker-end="url(#a)"/><path class="arrow" d="M170 210L328 150" marker-end="url(#a)"/>
+  <rect x="330" y="85" width="220" height="90" rx="12" fill="var(--brand-soft)" stroke="var(--brand)" stroke-width="2"/><text class="t" x="440" y="118" text-anchor="middle">MCP server</text><text class="s" x="440" y="138" text-anchor="middle">reads "who is calling"</text><text class="s" x="440" y="156" text-anchor="middle">picks that person's key</text>
+  <path class="arrow" d="M550 130H648" marker-end="url(#a)"/><text class="s" x="600" y="120" text-anchor="middle">as them</text>
+  <rect x="650" y="85" width="230" height="90" rx="12" fill="var(--erp-soft)" stroke="var(--erp)" stroke-width="1.5"/><text class="t" x="765" y="118" text-anchor="middle">ERPNext</text><text class="s" x="765" y="138" text-anchor="middle">checks THAT person's roles</text><text class="s" x="765" y="156" text-anchor="middle">allow or deny</text>
+</svg>
+<figcaption>The app tells the server who is chatting. No name means no access.</figcaption>
+</figure>
+<div class="card">
+  <p>So the assistant can never see or do more than you can in ERPNext. A real example from testing: asking "how many employees do we have?" as <code>manager</code> was refused, because ERPNext itself says that role cannot open Employee records.</p>
+  <p>On top of ERPNext's rules, the server adds two more: only <code>CONFIRM_CALLERS</code> may submit or cancel Sales Orders, and only <code>ITEM_CREATORS</code> may create items.</p>
+</div>
+
+<h2>6. The "yes" gate for changes</h2>
+<figure class="fig">
+<svg viewBox="0 0 900 270" role="img" aria-label="Confirmation sequence">
+  <text class="t" x="110" y="24" text-anchor="middle">You</text><text class="t" x="450" y="24" text-anchor="middle">Assistant</text><text class="t" x="790" y="24" text-anchor="middle">ERPNext</text>
+  <path d="M110 36V260M450 36V260M790 36V260" stroke="var(--line)" stroke-width="2" stroke-dasharray="5 5"/>
+  <path class="arrow" d="M110 62H446" marker-end="url(#a)"/><text class="s" x="280" y="55" text-anchor="middle">1. "create a note titled MCP test note…"</text>
+  <path class="arrow" d="M446 100H114" marker-end="url(#a)"/><text class="s" x="280" y="93" text-anchor="middle">2. "I will run create_doc with {…}. Reply yes or no."</text>
+  <text class="s" x="620" y="104" text-anchor="middle" style="fill:var(--write)">nothing written yet</text>
+  <path class="arrow" d="M110 140H446" marker-end="url(#a)"/><text class="s" x="280" y="133" text-anchor="middle">3. "yes"</text>
+  <path class="arrow" d="M450 170H786" marker-end="url(#a)"/><text class="s" x="620" y="163" text-anchor="middle">4. create the note, as you</text>
+  <path class="arrow" d="M786 200H454" marker-end="url(#a)"/><text class="s" x="620" y="193" text-anchor="middle">5. saved (or denied)</text>
+  <path class="arrow" d="M446 235H114" marker-end="url(#a)"/><text class="s" x="280" y="228" text-anchor="middle">6. "Done."  (or the reason it failed)</text>
+</svg>
+<figcaption>The preview text is written by code, not by the AI, so what you approve is exactly what runs. Replying "no" cancels and changes nothing.</figcaption>
+</figure>
+
+<h3>What it looks like in Telegram</h3>
+<div class="card">
+  <div class="chat">
+    <div class="bubble me">create a note titled MCP test note with the content hello from telegram</div>
+    <div class="bubble bot">I will run frappe.create_doc with {"data": {"content": "hello from telegram", "title": "MCP test note", "doctype": "Note"}}<br>Please reply yes to confirm or no to cancel.</div>
+    <div class="bubble me">yes</div>
+    <div class="bubble bot">Done. MCP tool frappe.create_doc ran. Note … saved.</div>
+  </div>
+</div>
+
+<h2>7. Under the hood</h2>
+<div class="card">
+  <ul>
+    <li><b>It is a small program</b> (<code>erpnext/mcp_server/frappe_server.py</code>) that the API starts by itself the first time a fallback is needed, and restarts if it stops.</li>
+    <li><b>They talk through plain text lines</b> on standard input and output (JSON messages). Three message types: say hello, list your tools, run this tool.</li>
+    <li><b>Reads vs writes</b> are decided by a label on each tool (<code>readOnlyHint</code>). Cancel is also marked <code>destructiveHint</code>.</li>
+    <li><b>Safety limits:</b> list size is capped, answers are cut at 4,000 characters, and a call that takes over 60 seconds is dropped.</li>
+    <li><b>No new setup:</b> the server reuses the same ERPNext address and per-person keys the app already has.</li>
+  </ul>
+</div>
+
+<h2>8. Turn it on</h2>
+<div class="card">
+  <p>Add one line to <code>erpnext/.env</code>, then restart the API from the <code>erpnext</code> folder:</p>
+<pre><code>MCP_SERVERS=frappe=venv/bin/python -m mcp_server.frappe_server</code></pre>
+  <p>Leave it empty and the assistant works exactly as before, sales tools only.</p>
+</div>
+
+<h2>9. What was tested</h2>
+<div class="card">
+  <table>
+    <tr><th>Test (Telegram)</th><th>Result</th></tr>
+    <tr><td>list all warehouses / customer groups</td><td><span class="pill ok">worked</span></td></tr>
+    <tr><td>count employees as manager</td><td><span class="pill ok">correctly refused by ERPNext</span></td></tr>
+    <tr><td>create a note, then "yes"</td><td><span class="pill ok">created as manager</span></td></tr>
+    <tr><td>create a note, then "no"</td><td><span class="pill ok">cancelled, nothing written</span></td></tr>
+    <tr><td>create a customer group, then "yes"</td><td><span class="pill ok">correctly refused by ERPNext</span></td></tr>
+    <tr><td>block-list, no-caller and Sales Order checks</td><td><span class="pill ok">worked (checked straight against the server)</span></td></tr>
+  </table>
+  <p>Full details are in <code>MCP_TEST_REPORT.md</code>.</p>
+</div>
+
+<h2>10. Good to know</h2>
+<div class="card">
+  <ul>
+    <li><b>It only kicks in when the sales tools cannot help.</b> The AI has to say it cannot do the request first.</li>
+    <li><b>The sales safety rules do not apply here.</b> Fuzzy-name suggestions and "price comes from ERPNext" belong to the built-in tools. For MCP requests ERPNext's own validation and your roles are the safety net.</li>
+    <li><b>The AI provider matters.</b> Heavy use can hit the provider's rate limit, and the bot then says "The assistant is unavailable right now."</li>
+    <li><b>Pending confirmations live in memory.</b> A restart forgets anything still waiting for a yes.</li>
+  </ul>
+</div>
+
+</main>
+</body>
+</html>

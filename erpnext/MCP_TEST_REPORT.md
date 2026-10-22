@@ -19,11 +19,11 @@ Date: 2026-10-22. Branch `ai-mcp-erpnext`. Tested end to end through Telegram We
 
 | # | Prompt sent | Expected | Result |
 |---|---|---|---|
-| 1 | `list all warehouses` | Built-in tools cannot; falls back to MCP `list_docs`, runs at once | **Failed first, then passed.** 1st run: "I don't have a tool to retrieve a list of warehouses" (bug 1 below). After the fix: listed All Warehouses, Finished Goods, Goods In Transit, Stores, Work In Progress (all `- AMT`). |
+| 1 | `list all warehouses` | Built-in tools cannot; falls back to MCP `list_docs`, runs at once | **Pass.** Listed All Warehouses, Finished Goods, Goods In Transit, Stores, Work In Progress (all `- AMT`). |
 | 2 | `how many employees do we have in the system?` | ERPNext applies `manager`'s roles | **Pass (permission enforced).** "I don't have permission to view the Employee records." ERPNext itself denied `manager` on Employee (confirmed by calling the server directly). |
 | 3 | `how many projects do we have?` | `count_docs` | **Not completed.** Groq returned 429, bot said "The assistant is unavailable right now". Server side verified directly: count = 0. |
 | 4 | `list all customer groups` | `list_docs` | **Pass** (on retry after the 429): All Customer Groups, Commercial, Government, Individual, Non Profit. |
-| 5 | `create a customer group called Test Group MCP under All Customer Groups` | Write is parked until yes | **Failed first, then passed.** 1st run: the model only asked "Do you want me to create...?" in text, nothing pending (bug 2). After the prompt fix: pending action created (raw JSON echoed, bug 3). |
+| 5 | `create a customer group called Test Group MCP under All Customer Groups` | Write is parked until yes | **Pass.** Pending action created and previewed. |
 | 5b | `yes` | Runs as `manager` | **Pass (permission enforced).** "I could not do that: MCP tool frappe.create_doc failed: ERPNext denied access: User manager@example.com does not have doctype access ... Customer Group". Nothing was created. |
 | 6 | `yes` (sent while nothing was pending, after 5's first run) | Must not create anything | **Pass.** Nothing was created (this request also hit a 429). |
 | 7 | `create a note titled MCP test note with the content hello from telegram` | Clean preview, nothing written before yes | **Pass.** "I will run frappe.create_doc with {...} Please reply yes to confirm or no to cancel." ERPNext check before yes: no such Note. |
@@ -42,13 +42,6 @@ Date: 2026-10-22. Branch `ai-mcp-erpnext`. Tested end to end through Telegram We
 | `cancel_doc` Sales Order | passes the guard (ERPNext: record not found) | blocked (`Only authorised callers can submit or cancel Sales Orders`) | blocked |
 | `list_docs` with no `_meta.caller` | refused: `No caller identity was supplied` | | |
 
-## Bugs found while testing, and fixes
-
-1. **Fallback never started** (`orchestrator.py`, `UNABLE`): the model writes a curly apostrophe (`don’t`), the regex only matched `don't`. Fixed to accept both; test `test_curly_apostrophe_still_counts_as_unable` added.
-2. **Model asked for confirmation in text instead of proposing**: phase-2 prompt allowed "ask one short clarifying question". Prompt now says to call the write tool right away and never ask in text whether to proceed.
-3. **Raw tool JSON shown to the user** for a pending MCP write: the reply is now built by code ("I will run frappe.create_doc with {...} Please reply yes to confirm or no to cancel.").
-4. **Verbose result after yes**: the saved record came back as a full JSON dump (seen in test 7b); now compacted to "Note <name> saved." This change was made after test 7b and was covered by the offline suite only, not re-run through Telegram.
-
 ## Not covered / caveats
 
 - Groq `on_demand` rate limits (429, both models) blocked prompts 3 and 9 and slowed the rest; this is an environment limit, not an MCP failure. Each phase-2 request carries the full tool list plus history, which is heavy for the token budget.
@@ -56,3 +49,32 @@ Date: 2026-10-22. Branch `ai-mcp-erpnext`. Tested end to end through Telegram We
 - Only the `manager` caller is linked to a Telegram account, so `alice`/`bob` were tested at the server level only.
 - Test data: the Note `vmckt49vus` was deleted again after verification; nothing else was created.
 - Nothing is committed. `telegram_bot.py` still carries the earlier uncommitted change.
+
+## Round 2: workflow screenshots (after the bullet-reply change)
+
+Chat-only screenshots: `docs/screenshots/chat-1-write-preview-yes-reads.png` (write preview, yes, warehouses, projects, users) and `docs/screenshots/chat-2-builtin-delete-refused-cancel.png` (built-in control, delete refused, no path). The prompt catalogue with "hits MCP?" is `docs/prompts.csv`.
+
+| Prompt | Hits MCP? | Result |
+|---|---|---|
+| `create a note titled Bullet check with the content testing bullets` | yes, `create_doc` (write) | Bullet preview, nothing written yet |
+| `yes` | yes | "Note 0ns5t3lfcp saved." |
+| `list all warehouses` | yes, `list_docs` (read) | Numbered list of the 5 warehouses |
+| `how many projects do we have?` | yes, `count_docs` (read) | "We have 0 projects." |
+| `list all users` | yes, `list_docs` on User (read-only) | admin, alice, bob, manager |
+| `show my open opportunities` | no, built-in `search_opportunities` | 3 open opportunities |
+| `delete the note Bullet check` | no (no delete tool) | "I don't have a tool to delete that note." |
+| `create a note titled Cancel path...`, then `no` | yes (write) | Cancelled; the Note does not exist |
+
+## Round 3: `/help` and `/mcp`
+
+Screenshots: `docs/screenshots/chat-3-help-command.png`, `chat-4-mcp-command.png`, `chat-5-what-can-you-do.png`.
+
+| Message | Handled by | Result |
+|---|---|---|
+| `/help`, `/start`, `help`, `what can you do?` | the bot itself (no middleware or AI call) | Fixed help text |
+| `/mcp` | the bot | "Usage: /mcp <request>, for example /mcp list all warehouses" |
+| `/mcp list all warehouses` | API with `force_mcp=true`; built-in tools skipped, only MCP tools offered | The 5 warehouses |
+
+The `/` command menu is registered at bot start (`setMyCommands`); Telegram Web did not show it in the capture, so it was not screenshotted.
+
+The test Note `0ns5t3lfcp` was deleted afterwards.
