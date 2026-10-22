@@ -184,6 +184,8 @@ class StubERPNext:
             return {"customer": q["party_name"], "customer_name": q["customer_name"], "transaction_date": TODAY.isoformat(),
                     "items": [{"item_code": i["item_code"], "qty": i["qty"], "rate": i["rate"]} for i in q["items"]] or
                              [{"item_code": "WS-4", "qty": 1, "rate": 360}]}
+        if method.endswith("get_count"):
+            return len([r for r in self.db.get(kwargs["doctype"], []) if all(_match(r, f) for f in kwargs.get("filters") or [])])
         if method.endswith("add_comment"):
             return {"name": "COMMENT-1"}
         raise ERPError(f"stub: unknown method {method}")

@@ -97,7 +97,7 @@ def test_hub_calls_a_tool_and_skips_notifications(hub):
     h, log = hub
     out = h.call("mcp__fake__get_weather", {"city": "Muscat"})
     assert out == {"server": "fake", "tool": "get_weather", "content": "Sunny in Muscat"}
-    assert calls(log) == [{"name": "get_weather", "arguments": {"city": "Muscat"}}]
+    assert calls(log) == [{"name": "get_weather", "arguments": {"city": "Muscat"}, "meta": None}]
 
 
 def test_hub_reports_tool_errors_and_unknown_tools(hub):
@@ -144,7 +144,7 @@ def test_unable_reply_falls_back_to_read_only_mcp_tool(app_ctx):
     out = prompt(client, "What's the weather in Muscat?")
     assert out["reply"] == "It is sunny in Muscat." and out["pending_action"] is None
     assert any(n.startswith("mcp__") for n in llm.offered[1])  # phase 2 offers the MCP tools
-    assert calls(log) == [{"name": "get_weather", "arguments": {"city": "Muscat"}}]  # a read runs at once
+    assert calls(log) == [{"name": "get_weather", "arguments": {"city": "Muscat"}, "meta": {"caller": "alice"}}]  # a read runs at once
 
 
 def test_mcp_write_waits_for_yes(app_ctx):
@@ -158,7 +158,7 @@ def test_mcp_write_waits_for_yes(app_ctx):
     assert calls(log) == []  # nothing ran yet
     done = prompt(client, "yes")
     assert done["reply"].startswith("Done. MCP tool fake.create_note ran. create_note ok")
-    assert calls(log) == [{"name": "create_note", "arguments": {"text": "call back Nizwa"}}]
+    assert calls(log) == [{"name": "create_note", "arguments": {"text": "call back Nizwa"}, "meta": {"caller": "alice"}}]
 
 
 def test_mcp_write_cancelled_with_no(app_ctx):
@@ -204,3 +204,21 @@ def test_no_fallback_when_nothing_configured(tmp_path):
     with TestClient(app) as client:
         assert prompt(client, "weather?")["reply"] == "I can't check the weather."
     assert len(llm.offered) == 1
+
+
+def test_caller_is_sent_with_reads_and_confirmed_writes(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("I can't do that with my tools."),
+                 tool_call("mcp__fake__get_weather", {"city": "Muscat"}), reply("Sunny."),
+                 reply("I can't do that with my tools."), tool_call("mcp__fake__create_note", {"text": "hi"}), reply("Reply yes to confirm.")]
+    prompt(client, "weather in Muscat")
+    out = prompt(client, "note hi")
+    assert [c["meta"] for c in calls(log)] == [{"caller": "alice"}]  # the write has not run yet
+    client.post(f"/v1/actions/{out['pending_action']['id']}/confirm", headers={"X-API-Key": "k1"})
+    assert [c["meta"] for c in calls(log)] == [{"caller": "alice"}, {"caller": "alice"}]
+
+
+def test_curly_apostrophe_still_counts_as_unable(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("I’m sorry, but I don’t have a tool for that."), tool_call("mcp__fake__get_weather", {"city": "X"}), reply("Sunny.")]
+    assert prompt(client, "weather in X")["reply"] == "Sunny."

@@ -41,7 +41,7 @@ def execute(state, action: PendingAction) -> dict:
         if hub is None:
             raise ValidationFailed("MCP fallback is not configured")
         try:
-            return hub.call(p["tool_name"], p["arguments"])
+            return hub.call(p["tool_name"], p["arguments"], action.caller)
         except MCPError as exc:
             raise ValidationFailed(f"MCP tool {p['server']}.{p['tool']} failed: {exc}") from exc
     raise ValidationFailed(f"Unknown action kind {action.kind}")

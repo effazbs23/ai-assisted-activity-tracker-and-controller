@@ -45,7 +45,7 @@ for line in sys.stdin:
         name, args = req["params"]["name"], req["params"].get("arguments") or {}
         if LOG:
             with open(LOG, "a") as fh:
-                fh.write(json.dumps({"name": name, "arguments": args}) + "\n")
+                fh.write(json.dumps({"name": name, "arguments": args, "meta": req["params"].get("_meta")}) + "\n")
         # a notification before the response: the client must skip it
         send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "working"}})
         if name == "get_broken":

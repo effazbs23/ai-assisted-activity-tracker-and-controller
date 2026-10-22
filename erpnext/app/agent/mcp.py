@@ -137,8 +137,11 @@ class MCPServer:
             if not cursor:
                 return tools
 
-    def call_tool(self, name: str, arguments: dict | None = None) -> str:
-        result = self._request("tools/call", {"name": name, "arguments": arguments or {}}) or {}
+    def call_tool(self, name: str, arguments: dict | None = None, caller: str | None = None) -> str:
+        params: dict = {"name": name, "arguments": arguments or {}}
+        if caller:
+            params["_meta"] = {"caller": caller}  # servers that act per user (mcp_server/) read this; others ignore it
+        result = self._request("tools/call", params) or {}
         parts = []
         for block in result.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "text":
@@ -243,7 +246,7 @@ class MCPHub:
     def is_read_only(self, full_name: str) -> bool:
         return bool(self._tools.get(full_name, {}).get("read_only"))
 
-    def call(self, full_name: str, arguments: dict | None = None) -> dict:
+    def call(self, full_name: str, arguments: dict | None = None, caller: str | None = None) -> dict:
         self.tools()
         with self._lock:
             meta = self._tools.get(full_name)
@@ -251,7 +254,7 @@ class MCPHub:
                 raise MCPError(f"unknown MCP tool '{full_name}'")
             conn = self._conns[meta["server"]]
             conn.start()  # respawns a server that exited since discovery
-            return {"server": meta["server"], "tool": meta["tool"], "content": conn.call_tool(meta["tool"], arguments)}
+            return {"server": meta["server"], "tool": meta["tool"], "content": conn.call_tool(meta["tool"], arguments, caller)}
 
     def close(self) -> None:
         with self._lock:

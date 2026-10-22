@@ -16,9 +16,9 @@ NO = re.compile(r"^\s*(no|n|nope|cancel|stop|abort|never ?mind)\W*$", re.I)
 ASKS_CONFIRM = re.compile(r"\b(reply|say|respond)\b.{0,40}\byes\b|\bconfirm\b.{0,30}\?", re.I | re.S)
 REJECT = re.compile(r"^\s*(no|nope|nah|not (that|it|this|them)|neither|none|different|a different|another|new)\b", re.I)
 # A final reply that admits the built-in tools cannot do the job unlocks the MCP fallback.
-UNABLE = re.compile(r"\b(can(?:not|'t)|cannot|unable to|not able to|i don'?t have|i do not have|"
-                    r"no (?:tool|way)|doesn'?t (?:support|allow)|does not (?:support|allow)|"
-                    r"outside (?:my|the|these)|not something i|isn'?t something)\b", re.I)
+UNABLE = re.compile(r"\b(can(?:not|['’]t)|cannot|unable to|not able to|i don['’]?t have|i do not have|"
+                    r"no (?:tool|way)|doesn['’]?t (?:support|allow)|does not (?:support|allow)|"
+                    r"outside (?:my|the|these)|not something i|isn['’]?t something)\b", re.I)
 MAX_STEPS = 6
 MAX_MCP_STEPS = 6
 MAX_TOOL_RESULT_CHARS = 4000
@@ -64,12 +64,14 @@ Known from this conversation: {entities}"""
 
 MCP_NOTE = ("Extra capability: requests outside the built-in tools can fall back to MCP servers ({servers}); their tools "
             "then appear with names starting mcp__. If you cannot fulfil a request with the tools you have, say so briefly "
-            "and honestly instead of inventing an answer.")
+            "and honestly instead of inventing an answer. The 'frappe' server reaches any other ERPNext doctype (stock, HR, "
+            "accounting, projects, reports) as the current user: call mcp__frappe__describe_doctype before create_doc.")
 
 MCP_FALLBACK = ("[system] The built-in tools cannot handle this request. Extended MCP tools are now available (names start "
                 "with mcp__). Use them to help the user. Read-only MCP tools run immediately; any other MCP tool only "
-                "PROPOSES the call and the user must reply yes before it runs. Do not apologise; call the right tool now, "
-                "or ask one short clarifying question.")
+                "PROPOSES the call and the user must reply yes before it runs, so for a create/update/submit/cancel request call the "
+                "tool right away; never ask the user in text whether to proceed. Do not apologise; call the right tool now, "
+                "or ask one short clarifying question only if a required detail is missing.")
 
 
 class Orchestrator:
@@ -131,7 +133,14 @@ class Orchestrator:
         if kind == "update_opportunity":
             return f"Opportunity {r['id']} updated (stage {r.get('sales_stage')}, status {r.get('status')})."
         if kind == "mcp_call":
-            return f"MCP tool {r['server']}.{r['tool']} ran. {str(r.get('content', ''))[:300]}"
+            text = str(r.get("content", ""))
+            try:  # a saved record comes back as one big JSON doc: say what was saved, not all of it
+                doc = json.loads(text)
+                if isinstance(doc, dict) and doc.get("doctype") and doc.get("name"):
+                    text = f"{doc['doctype']} {doc['name']} saved."
+            except ValueError:
+                pass
+            return f"MCP tool {r['server']}.{r['tool']} ran. {text[:300]}"
         return "Done."
 
     # -- main entry ---------------------------------------------------------------------------
@@ -172,6 +181,10 @@ class Orchestrator:
                      "I could not prepare that action. Please rephrase with the client and what happened. Nothing was changed.")
         if pending and (notice := self._new_item_notice(pending)) and notice not in reply:
             reply = f"{reply}\n{notice}"  # stated by code, so the user always sees what will be created
+        if pending and pending.kind == "mcp_call":  # stated by code: the exact call "yes" will run
+            p = pending.payload
+            reply = (f"I will run {p['server']}.{p['tool']} with {json.dumps(p['arguments'], default=str)[:400]}\n"
+                     "Please reply yes to confirm or no to cancel.")
         session.suggested = set(fuzzy)  # what the user is being asked about right now
         st.sessions.add(session, "assistant", reply)
         return {"reply": reply, "pending_action": (
@@ -234,7 +247,7 @@ class Orchestrator:
         """An MCP tool call: read-only ones run now; anything else is parked as a pending action."""
         try:
             if mcp.is_read_only(name):
-                return {"data": mcp.call(name, args)}
+                return {"data": mcp.call(name, args, caller)}
             action = proposals.mcp_call(self.st, caller, name, args)
             return {"data": {"status": "awaiting_user_confirmation", "preview": action.payload}, "action": action}
         except MCPError as exc:
