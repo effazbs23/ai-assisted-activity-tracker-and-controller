@@ -125,6 +125,88 @@ def seed_transactions(users: dict[str, ERPClient]) -> None:
         print("  sales activities")
 
 
+SUPPLIERS = [("Gulf Timber Supplies", "Raw Material"), ("Oman Steel Works", "Raw Material"), ("Muscat Fabrics LLC", "Local"),
+             ("Al Batinah Hardware", "Hardware")]
+STOCK_ITEMS = [  # code, name, rate, qty in Stores, qty in Finished Goods
+    ("BOLT-M8", "Hex Bolt M8", 0.15, 2000, 0), ("PANEL-MDF", "MDF Panel 18mm", 12.5, 150, 40),
+    ("CASTOR-50", "Castor Wheel 50mm", 1.2, 600, 120), ("FABRIC-GRY", "Grey Office Fabric", 3.4, 300, 0),
+]
+PROJECTS = [("Nizwa Builders Fit-Out", "Open"), ("Gulf Interiors Showroom", "Open"), ("Muscat Office Refresh", "Completed")]
+TASKS = [("Measure site", 0, "Completed"), ("Order materials", 0, "Working"), ("Install workstations", 0, "Open"),
+         ("Design review", 1, "Working"), ("Deliver conference table", 1, "Open"), ("Handover and sign-off", 2, "Completed")]
+EMPLOYEES = [("Aisha", "Al Balushi", "Female", "Sales"), ("Khalid", "Al Harthy", "Male", "Sales"), ("Maya", "Rawahi", "Female", "Sales"),
+             ("Salim", "Al Lawati", "Male", "Accounts"), ("Fatma", "Al Kindi", "Female", "Human Resources")]
+NOTES = [("Showroom visit checklist", "Bring catalogue, price list and sample fabrics."),
+         ("Nizwa Builders follow-up", "Call the procurement lead about the desk delivery date."),
+         ("Quarter targets", "Close two fit-out quotations before month end.")]
+TODOS = ["Call Nizwa Builders about the delivery date", "Send the revised offer to XYZ Traders"]
+
+
+def submit(admin: AdminSession, doctype: str, doc: dict) -> dict:
+    saved = admin.insert(doctype, doc)
+    return admin.request("POST", "/api/method/frappe.client.submit", json={"doc": saved})["message"]
+
+
+def count(admin: AdminSession, doctype: str) -> int:
+    return admin.request("GET", "/api/method/frappe.client.get_count", params={"doctype": doctype})["message"]
+
+
+def seed_extra(admin: AdminSession, manager: ERPClient) -> None:
+    """Data for the non-sales demo prompts (docs/prompts.csv): suppliers, stock, invoices, projects, employees, notes."""
+    company = admin.request("GET", "/api/resource/Company")["data"][0]["name"]
+    for name, group in SUPPLIERS:
+        if not admin.exists("Supplier", name):
+            admin.insert("Supplier", {"supplier_name": name, "supplier_group": group, "supplier_type": "Company"})
+            print(f"  supplier {name}")
+    for code, name, rate, *_ in STOCK_ITEMS:
+        if not admin.exists("Item", code):
+            admin.insert("Item", {"item_code": code, "item_name": name, "item_group": "Raw Material", "stock_uom": "Nos",
+                                  "is_stock_item": 1, "is_sales_item": 0, "valuation_rate": rate, "standard_rate": rate})
+            print(f"  stock item {code}")
+    if count(admin, "Stock Entry") == 0:
+        for warehouse, col in (("Stores - AMT", 3), ("Finished Goods - AMT", 4)):
+            rows = [{"item_code": i[0], "qty": i[col], "basic_rate": i[2], "t_warehouse": warehouse} for i in STOCK_ITEMS if i[col]]
+            submit(admin, "Stock Entry", {"stock_entry_type": "Material Receipt", "company": company, "posting_date": D(10), "items": rows})
+        print("  stock receipts")
+    if count(admin, "Sales Invoice") == 0:
+        price = {code: rate for code, _, rate in ITEMS}
+        for customer, when, due, items in [("Nizwa Builders", 25, 5, (("DESK-EX", 4), ("CHAIR-ERG", 4))),
+                                           ("Gulf Interiors LLC", 8, -22, (("TBL-CONF", 2), ("CHAIR-ERG", 12))),
+                                           ("Muscat Office Solutions", 4, -26, (("CAB-FILE", 6),))]:
+            submit(admin, "Sales Invoice", {"customer": customer, "company": company, "posting_date": D(when), "set_posting_time": 1,
+                                            "due_date": D(due), "items": [{"item_code": c, "qty": q, "rate": price[c]} for c, q in items]})
+        print("  sales invoices (unpaid)")
+    if count(admin, "Project") == 0:
+        names = []
+        for name, status in PROJECTS:
+            names.append(admin.insert("Project", {"project_name": name, "status": status, "company": company,
+                                                  "expected_start_date": D(20), "expected_end_date": (TODAY + dt.timedelta(days=40)).isoformat()})["name"])
+        for subject, idx, status in TASKS:
+            admin.insert("Task", {"subject": subject, "project": names[idx], "status": status, "priority": "Medium"})
+        print("  projects and tasks")
+    if count(admin, "Employee") == 0:
+        for first, last, gender, dept in EMPLOYEES:
+            department = f"{dept} - AMT"
+            admin.insert("Employee", {"first_name": first, "last_name": last, "gender": gender, "company": company,
+                                      "date_of_birth": "1990-05-12", "date_of_joining": D(400), "status": "Active",
+                                      **({"department": department} if admin.exists("Department", department) else {})})
+        print("  employees")
+    if empty(manager, "Note"):
+        for title, content in NOTES:
+            manager.insert("Note", {"title": title, "content": content})
+        print("  notes")
+    if empty(manager, "ToDo"):
+        for text in TODOS:
+            manager.insert("ToDo", {"description": text, "priority": "Medium", "date": (TODAY + dt.timedelta(days=1)).isoformat()})
+        print("  todos")
+    if not manager.get_list("Sales Order", [["customer", "=", "Salalah Hospitality Group"]], ["name"], 1):
+        delivery = (TODAY + dt.timedelta(days=15)).isoformat()
+        doc = doc_with(manager, "Sales Order", {"customer": "Salalah Hospitality Group", "transaction_date": D(2), "delivery_date": delivery,
+                                                "order_type": "Sales", "items": [{"item_code": "WB-GLASS", "qty": 5, "rate": 60,
+                                                                                  "delivery_date": delivery}]}, True)
+        print(f"  extra sales order {doc['name']} (safe to cancel in the demo)")
+
+
 def main():
     settings = Settings.from_env()
     missing = [c for c in ("alice", "bob", "manager") if c not in settings.erp_users]
@@ -141,6 +223,11 @@ def main():
         seed_transactions(users)
     except ERPError as exc:
         raise SystemExit(f"Seeding failed: {exc}")
+    print("Other areas (stock, invoices, projects, employees, notes)")
+    try:
+        seed_extra(admin, users["manager"])
+    except (ERPError, RuntimeError) as exc:
+        raise SystemExit(f"Extra seeding failed: {exc}")
     print("Done.")
 
 

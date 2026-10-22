@@ -279,6 +279,8 @@ venv/bin/python scripts/seed_demo.py
 
 ## 11. Using the Telegram bot
 
+**Bot commands.** `/help` (also `/start`, `help`, `what can you do?`) shows what the bot can do; it is answered by the bot itself, without the AI. `/mcp <request>` sends the request with `force_mcp=true` on `POST /v1/prompt`, so the built-in sales tools are skipped and only the MCP tools are offered (for example `/mcp list all warehouses`); it says so if MCP is not enabled. `/id` works for everyone. The bot registers these in Telegram's `/` menu at start-up.
+
 **First-time pairing.** The bot ignores everyone except users in `TELEGRAM_USERS`. To find an id, send `/id` to the bot (this works for anyone). Add `id:caller` to `TELEGRAM_USERS` (for example `123456789:alice`), then restart the bot. Each Telegram user is mapped to one caller, and that caller is one ERPNext user.
 
 **Conversation rules**
@@ -380,7 +382,7 @@ Status codes: `401` bad key, `403` caller may not confirm Sales Orders, `404` no
 
 ## 15. Demo data and demo prompts
 
-`scripts/seed_demo.py` creates (company currency OMR): 6 customers (Nizwa Builders, Gulf Interiors LLC, XYZ Traders, Muscat Office Solutions, Sohar Contracting, Salalah Hospitality Group), 6 items with prices (Workstation 4-Seat 350, Executive Desk 420, Ergonomic Chair 95, Conference Table 780, Filing Cabinet 140, Glass Whiteboard 60), 3 leads (XYZ Interiors, Al Khuwair Developers, Barka Fit-Out Works), 3 opportunities, 5 quotations (4 submitted, 1 draft), 3 sales orders (2 submitted) and 13 sales activities spread over the last five weeks. Transactions are created **as the sales users themselves**, so ownership and permissions look real.
+`scripts/seed_demo.py` creates (company currency OMR): 6 customers (Nizwa Builders, Gulf Interiors LLC, XYZ Traders, Muscat Office Solutions, Sohar Contracting, Salalah Hospitality Group), 6 items with prices (Workstation 4-Seat 350, Executive Desk 420, Ergonomic Chair 95, Conference Table 780, Filing Cabinet 140, Glass Whiteboard 60), 3 leads (XYZ Interiors, Al Khuwair Developers, Barka Fit-Out Works), 3 opportunities, 5 quotations (4 submitted, 1 draft), 3 sales orders (2 submitted) and 13 sales activities spread over the last five weeks. Transactions are created **as the sales users themselves**, so ownership and permissions look real. It also seeds the data behind the non-sales demo prompts (`docs/prompts.csv`): 4 suppliers, 4 stock items with stock in Stores and Finished Goods, 3 unpaid sales invoices, 3 projects with 6 tasks, 5 employees, 3 notes and 2 to-dos for `manager`, and one extra submitted Sales Order (`SAL-ORD-2026-00004`) that is safe to cancel in the demo. `reset_demo.py` does not remove these extras.
 
 | Caller | ERPNext user | Roles | Can submit Sales Orders |
 |---|---|---|---|
