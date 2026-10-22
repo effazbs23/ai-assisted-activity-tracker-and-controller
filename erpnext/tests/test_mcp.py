@@ -222,3 +222,11 @@ def test_curly_apostrophe_still_counts_as_unable(app_ctx):
     client, llm, log, _ = app_ctx
     llm.queue = [reply("I’m sorry, but I don’t have a tool for that."), tool_call("mcp__fake__get_weather", {"city": "X"}), reply("Sunny.")]
     assert prompt(client, "weather in X")["reply"] == "Sunny."
+
+
+def test_pending_mcp_write_is_bullets_not_json(app_ctx):
+    client, llm, log, _ = app_ctx
+    llm.queue = [reply("I can't do that."), tool_call("mcp__fake__create_note", {"text": "call back", "data": {"title": "T"}}),
+                 reply('{"status": "awaiting_user_confirmation"}')]
+    text = prompt(client, "note it")["reply"]
+    assert "{" not in text and "• text: call back" in text and "• title: T" in text and "yes" in text

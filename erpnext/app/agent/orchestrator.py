@@ -73,6 +73,15 @@ MCP_FALLBACK = ("[system] The built-in tools cannot handle this request. Extende
                 "or ask one short clarifying question only if a required detail is missing.")
 
 
+def _bullets(value, prefix: str = "") -> list[str]:
+    """Nested dict/list -> flat '• key: value' lines, so chat replies never show JSON."""
+    if isinstance(value, dict):
+        return [b for k, v in value.items() for b in _bullets(v, f"{prefix}{k}: " if not isinstance(v, (dict, list)) else f"{prefix}{k} ")]
+    if isinstance(value, list):
+        return [b for i, v in enumerate(value, 1) for b in _bullets(v, f"{prefix}{i}. ")]
+    return [] if value in (None, "") else [f"• {prefix}{value}"]
+
+
 class Orchestrator:
     def __init__(self, st, llm):
         self.st, self.llm = st, llm
@@ -133,10 +142,12 @@ class Orchestrator:
             return f"Opportunity {r['id']} updated (stage {r.get('sales_stage')}, status {r.get('status')})."
         if kind == "mcp_call":
             text = str(r.get("content", ""))
-            try:  # a saved record comes back as one big JSON doc: say what was saved, not all of it
+            try:  # results are JSON: say what was saved, or list the fields, never dump JSON into the chat
                 doc = json.loads(text)
                 if isinstance(doc, dict) and doc.get("doctype") and doc.get("name"):
                     text = f"{doc['doctype']} {doc['name']} saved."
+                elif isinstance(doc, (dict, list)):
+                    text = "\n" + "\n".join(_bullets(doc)[:15])
             except ValueError:
                 pass
             return f"MCP tool {r['server']}.{r['tool']} ran. {text[:300]}"
@@ -182,8 +193,10 @@ class Orchestrator:
             reply = f"{reply}\n{notice}"  # stated by code, so the user always sees what will be created
         if pending and pending.kind == "mcp_call":  # stated by code: the exact call "yes" will run
             p = pending.payload
-            reply = (f"I will run {p['server']}.{p['tool']} with {json.dumps(p['arguments'], default=str)[:400]}\n"
-                     "Please reply yes to confirm or no to cancel.")
+            args = dict(p["arguments"])
+            lines = _bullets({k: v for k, v in args.items() if k != "data"}) + _bullets(args.get("data"))
+            reply = "\n".join([f"I will run {p['server']}.{p['tool']}:", *lines[:20],
+                               "Please reply yes to confirm or no to cancel."])
         session.suggested = set(fuzzy)  # what the user is being asked about right now
         st.sessions.add(session, "assistant", reply)
         return {"reply": reply, "pending_action": (
